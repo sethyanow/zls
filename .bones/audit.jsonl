@@ -15,6 +15,3 @@
 {"timestamp":"2026-04-12T16:53:55.120177+00:00","actor":"Seth","event_type":"updated","task_id":"zls-91m","details":{"status":"active"}}
 {"timestamp":"2026-04-12T17:11:21.273738+00:00","actor":"Seth","event_type":"closed","task_id":"zls-91m","details":{"notes":null}}
 {"timestamp":"2026-04-12T17:12:16.982334+00:00","actor":"Seth","event_type":"logged","task_id":"zls-91m","details":{"message":"Task complete. Implementation: loadTransitiveImports in DocumentStore (worklist pattern, getHandle guard for cycles), called from openLspSyncedDocument and references.zig workspace search. Key design change from skeleton: on-demand loading placed BEFORE gatherWorkspaceReferenceCandidates (not in fallback path) because .unresolved build file returns .empty, making fallback unreachable. 6 tests: R5 (eager), R6 (on-demand), self-import, diamond, empty, idempotency. Full suite 579/590 pass (11 skipped). Adversarial stress test clean."}}
-{"timestamp":"2026-04-12T17:12:28.501599+00:00","actor":"Seth","event_type":"created","task_id":"zls-691","details":{}}
-{"timestamp":"2026-04-12T17:12:32.452948+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-h4v","details":{"kind":"parent-child","to":"zls-691"}}
-{"timestamp":"2026-04-12T17:12:32.453450+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-h4v","details":{"kind":"blocks","to":"zls-691"}}
