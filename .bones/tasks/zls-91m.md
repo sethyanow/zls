@@ -8,6 +8,7 @@ parent: zls-h4v
 ---
 
 
+
 ## Context
 First task in Phase 1 (zls-h4v) of the call hierarchy epic (zls-xjj).
 
@@ -34,13 +35,13 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 
 ### Implementation steps
 
-1. **Create test fixture files** — `tests/fixtures/eager_load/{a.zig, b.zig, c.zig}` with import chain.
+1. **Create test fixture files** — `tests/fixtures/eager_load/{a.zig, b.zig, c.zig}` with import chain. R6 uses a SEPARATE directory `tests/fixtures/eager_load_late/{a.zig, b.zig}` (c.zig created at runtime by the test, cleaned up via defer).
 
 2. **Write R5 test** — in `tests/lsp_features/references.zig`. Open `a.zig` with `file://` URI. Assert transitive imports loaded.
 
 3. **Write R6 test** — in `tests/lsp_features/references.zig`. Open `a.zig` when `c.zig` missing, create `c.zig`, run findReferences, assert on-demand load.
 
-4. **DocumentStore eager loading** — in `src/DocumentStore.zig`, after `file_imports` are computed for a handle (around the `collectImports` / `updateFileImports` area), iterate the new `file_imports` and call `getOrLoadHandle` for each URI not already in `handles`. Since `getOrLoadHandle` triggers parsing which computes `file_imports` for the newly loaded file, this naturally cascades. Guard against cycles with a visited set or by checking `handles.contains(uri)` before loading (which `getOrLoadHandle` already does — it returns the existing handle if present).
+4. **DocumentStore eager loading** — **CRITICAL: Do NOT hook inside `createAndStoreDocument` or `Handle.refresh`** (future event not yet set → deadlock on cycles). Hook AFTER `createAndStoreDocument` returns, in `openLspSyncedDocument` (after line 862) and after `getOrLoadHandle` returns in the non-LSP path. Iterate the returned handle's `file_imports`, call `getOrLoadHandle` for each URI not already in `handles` (check `store.handles.contains(uri)` or `store.getHandle(uri) != null` first — do NOT call `getOrLoadHandle` to check, it awaits). Each newly loaded handle's `file_imports` feeds the next iteration (worklist pattern). Guard against cycles with `handles.contains(uri)` check before loading.
 
 5. **On-demand fallback in gatherWorkspaceReferenceCandidates** — in the fallback path (references.zig:369-391), when building `per_file_dependants`, also attempt to load any `file_imports` URI that isn't in the store yet. This ensures files discovered during the import graph walk are loaded even if the eager path somehow missed them.
 
@@ -55,6 +56,7 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 - [ ] gatherWorkspaceReferenceCandidates loads unresolved imports on-demand
 - [ ] `zig build test --summary all` passes (all existing tests still green)
 - [ ] `zig build check` compiles clean
+- [ ] Eager loading does not deadlock on self-imports or cycles (structural: hook runs after event is set)
 - [ ] `zig fmt --check .` passes
 
 ## Anti-Patterns
@@ -72,6 +74,35 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 - **Error propagation:** `getOrLoadHandle` returns `error.Canceled` or `error.OutOfMemory`. Propagate these (resource exhaustion / shutdown). All other errors return null.
 - **Cycle safety:** `getOrLoadHandle` returns existing handle if present, so re-visiting a URI is a no-op.
 
+### Failure Catalog (Adversarial Planning)
+
+**Temporal Betrayal: Deadlock in eager loading within `createAndStoreDocument`**
+- Assumption: We can call `getOrLoadHandle` for import URIs immediately after `Handle.refresh` computes `file_imports`.
+- Betrayal: `createAndStoreDocument` holds the handle's future event (`handle_future.event.set` is deferred at line 1649). If an imported file imports BACK to the original (circular `@import` in source text, or A→B→A), `getOrLoadHandle` finds the handle in `handles`, awaits its future which isn't set yet → **deadlock** (single-threaded test context blocks forever).
+- Consequence: Hang on any circular or self-referencing import in source text.
+- Mitigation: **Do NOT call `getOrLoadHandle` inside `createAndStoreDocument`.** Hook eager loading AFTER `createAndStoreDocument` returns (after event is set). Call site is in `openLspSyncedDocument` (line 851) or after the `getOrLoadHandle` call in references.zig build-system path. Alternatively, use `handles.contains(uri)` to skip already-present URIs — but this only prevents self-loops, not A→B→A where B is a new file whose loading triggers a nested `getOrLoadHandle(A)`.
+
+**CORRECTION — Skeleton's "Cycle safety" claim is WRONG:**
+- The skeleton says "getOrLoadHandle returns existing handle if present, so re-visiting a URI is a no-op." This is false. `getOrLoadHandle` → `createAndStoreDocument` → `getOrPut` finds existing → **awaits** the future (line 1610). If the future isn't set yet (same thread is still loading it), this deadlocks. The safe cycle check is `store.handles.contains(uri)` or `store.getHandle(uri) != null`, NOT `getOrLoadHandle`.
+
+**State Corruption: R6 test fixture cleanup**
+- Assumption: Runtime-created c.zig (the late-arriving file) is cleaned up after the R6 test.
+- Betrayal: If R6 test crashes before cleanup, c.zig persists in the fixtures directory. If R5 and R6 share the same fixture directory, subsequent R5 runs find c.zig already present → R5 passes for the wrong reason.
+- Consequence: Non-deterministic R5 test results after a failed R6 run.
+- Mitigation: **Use separate fixture directories** for R5 and R6. R5: `tests/fixtures/eager_load/`. R6: `tests/fixtures/eager_load_late/` (contains a.zig, b.zig pre-checked-in; c.zig is created and `defer`-deleted at runtime). Alternatively, R6 creates c.zig in a temp directory but that conflicts with needing it relative to b.zig's import path — so separate fixture dirs is the clean approach.
+
+**Temporal Betrayal: `per_file_dependants` stale after on-demand load**
+- Assumption: The reverse dependency map in `gatherWorkspaceReferenceCandidates` fallback (line 369-377) captures all import relationships.
+- Betrayal: On-demand loading adds new files to the store, but `per_file_dependants` was built from the snapshot of handles at iteration start. Newly loaded files' import relationships are invisible.
+- Consequence: On-demand loaded files are in the store but their dependants/dependencies aren't in the search's reverse map — partial coverage.
+- Mitigation: **Use forward-walking pattern instead of reverse map.** The build-system path (lines 358-365) follows `handle.file_imports` transitively — this naturally picks up newly loaded files. Restructure the fallback to walk forward from target_handle's file_imports (and their file_imports, etc.), loading via `getOrLoadHandle` as it goes. This mirrors the build-system path and avoids the stale reverse map entirely.
+
+**Temporal Betrayal: Test needing `file://` URIs via `addDocument`**
+- Assumption: Test context's `addDocument` can open files with `file://` URIs.
+- Betrayal: `addDocument` (context.zig:93) hardcodes `untitled://` scheme. Cannot produce `file://` URIs.
+- Consequence: R5/R6 tests must send raw `textDocument/didOpen` notifications with `file://` URIs directly via `self.server.sendNotificationSync`, bypassing `addDocument`. The text content must still be provided (LSP didOpen includes the text), but the URI must be `file://` pointing to the real fixture path so that `@import` resolution produces correct `file://` URIs for the imported files.
+- Mitigation: Construct `file://` URIs from absolute paths of fixture files. Send `textDocument/didOpen` directly. The imported files will be loaded from disk via `getOrLoadHandle(.uri)` — they don't need `didOpen`, the eager loader handles them.
+
 ## Key Files
 - `src/DocumentStore.zig` — primary change: eager loading after file_imports computed
 - `src/features/references.zig:327-391` — gatherWorkspaceReferenceCandidates on-demand fallback
@@ -81,3 +112,4 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 ## Log
 
 - [2026-04-12T12:43:02Z] [Seth] SRE refinement: Split monolithic test into three per-requirement tests. R5 (eager loading) and R6 (on-demand) use file:// fixtures checked into repo. R6 scenario: late-arriving file simulating Bazel-generated comptime bindings. R7 already covered by existing untitled:// cross-file tests. No changes to implementation steps 2-3.
+- [2026-04-12T16:53:42Z] [Seth] Adversarial planning complete. Critical findings: (1) DEADLOCK risk — eager loading must NOT run inside createAndStoreDocument (future event not set yet, getOrLoadHandle awaits → hangs on cycles). Hook point moved to after createAndStoreDocument returns. (2) Skeleton cycle-safety claim corrected — getOrLoadHandle awaits, doesn't return immediately. Safe check is handles.contains(uri). (3) R6 test needs separate fixture dir from R5 to prevent cross-contamination on cleanup failure. (4) addDocument uses untitled:// — tests must send raw didOpen with file:// URIs. (5) On-demand fallback should use forward-walking pattern (like build-system path) instead of stale reverse dependency map.
