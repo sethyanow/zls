@@ -1,13 +1,12 @@
 ---
 id: zls-91m
 title: Implement eager transitive import loading in DocumentStore
-status: closed
+status: active
 type: task
 priority: 1
 owner: Seth
 parent: zls-h4v
 ---
-
 
 
 
@@ -52,16 +51,16 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 6. **Verify all tests pass** — `zig build test --summary all`, `zig build check`, `zig fmt --check .`
 
 ## Success Criteria
-- [x] R5 test: opening a file loads its transitive imports into DocumentStore
-- [x] R6 test: on-demand fallback loads late-arriving files during reference search
-- [x] R7: existing cross-file reference tests still pass (no changes to references handler)
-- [x] Each test fails before its corresponding implementation (red step verified)
-- [x] DocumentStore eagerly loads transitive imports on file open
-- [x] gatherWorkspaceReferenceCandidates loads unresolved imports on-demand
-- [x] `zig build test --summary all` passes (all existing tests still green)
-- [x] `zig build check` compiles clean
-- [x] Eager loading does not deadlock on self-imports or cycles (structural: hook runs after event is set)
-- [x] `zig fmt --check .` passes
+- [ ] R5 test: opening a file loads its transitive imports into DocumentStore
+- [ ] R6 test: on-demand fallback loads late-arriving files during reference search
+- [ ] R7: existing cross-file reference tests still pass (no changes to references handler)
+- [ ] Each test fails before its corresponding implementation (red step verified)
+- [ ] DocumentStore eagerly loads transitive imports on file open
+- [ ] gatherWorkspaceReferenceCandidates loads unresolved imports on-demand
+- [ ] `zig build test --summary all` passes (all existing tests still green)
+- [ ] `zig build check` compiles clean
+- [ ] Eager loading does not deadlock on self-imports or cycles (structural: hook runs after event is set)
+- [ ] `zig fmt --check .` passes
 
 ## Anti-Patterns
 - NO modifying the references handler (R7: fix is in DocumentStore and gatherWorkspaceReferenceCandidates only)

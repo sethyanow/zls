@@ -23,12 +23,12 @@ This phase fixes the foundation so Phase 2 (call hierarchy) builds on reliable c
 - R7: `findReferences` cross-file coverage shall improve without changes to the references handler itself.
 
 ## Success Criteria
-- [x] When a file is opened in DocumentStore, all files reachable via `@import` chains are transitively loaded
-- [x] `gatherWorkspaceReferenceCandidates` loads unresolved imports on-demand as fallback
+- [ ] When a file is opened in DocumentStore, all files reachable via `@import` chains are transitively loaded
+- [ ] `gatherWorkspaceReferenceCandidates` loads unresolved imports on-demand as fallback
 - [ ] `findReferences` returns results across all transitively imported files (not just already-opened files)
-- [x] `zig build test --summary all` passes
-- [x] `zig build check` compiles clean
-- [x] `zig fmt --check .` passes
+- [ ] `zig build test --summary all` passes
+- [ ] `zig build check` compiles clean
+- [ ] `zig fmt --check .` passes
 - [ ] Live LSP demo: `findReferences` on `resolveTypeOfNode` finds callers in 5+ feature files
 
 ## Anti-Patterns
