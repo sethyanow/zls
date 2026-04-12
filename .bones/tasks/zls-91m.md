@@ -13,6 +13,7 @@ parent: zls-h4v
 
 
 
+
 ## Context
 First task in Phase 1 (zls-h4v) of the call hierarchy epic (zls-xjj).
 
@@ -117,3 +118,4 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 
 - [2026-04-12T12:43:02Z] [Seth] SRE refinement: Split monolithic test into three per-requirement tests. R5 (eager loading) and R6 (on-demand) use file:// fixtures checked into repo. R6 scenario: late-arriving file simulating Bazel-generated comptime bindings. R7 already covered by existing untitled:// cross-file tests. No changes to implementation steps 2-3.
 - [2026-04-12T16:53:42Z] [Seth] Adversarial planning complete. Critical findings: (1) DEADLOCK risk — eager loading must NOT run inside createAndStoreDocument (future event not set yet, getOrLoadHandle awaits → hangs on cycles). Hook point moved to after createAndStoreDocument returns. (2) Skeleton cycle-safety claim corrected — getOrLoadHandle awaits, doesn't return immediately. Safe check is handles.contains(uri). (3) R6 test needs separate fixture dir from R5 to prevent cross-contamination on cleanup failure. (4) addDocument uses untitled:// — tests must send raw didOpen with file:// URIs. (5) On-demand fallback should use forward-walking pattern (like build-system path) instead of stale reverse dependency map.
+- [2026-04-12T17:12:16Z] [Seth] Task complete. Implementation: loadTransitiveImports in DocumentStore (worklist pattern, getHandle guard for cycles), called from openLspSyncedDocument and references.zig workspace search. Key design change from skeleton: on-demand loading placed BEFORE gatherWorkspaceReferenceCandidates (not in fallback path) because .unresolved build file returns .empty, making fallback unreachable. 6 tests: R5 (eager), R6 (on-demand), self-import, diamond, empty, idempotency. Full suite 579/590 pass (11 skipped). Adversarial stress test clean.
