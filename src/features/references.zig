@@ -308,16 +308,6 @@ fn symbolReferences(
 
     const workspace = local_node == null and request != .highlight and target_symbol.isPublic();
     if (workspace) {
-        // On-demand fallback (R6): re-attempt transitive import loading on all
-        // existing handles before the workspace search. This catches files that
-        // appeared on disk after the initial eager load (e.g. build output).
-        {
-            var it: DocumentStore.HandleIterator = .{ .store = analyser.store };
-            while (it.next()) |handle| {
-                try analyser.store.loadTransitiveImports(handle);
-            }
-        }
-
         var uris = try gatherWorkspaceReferenceCandidates(
             analyser.store,
             analyser.arena,

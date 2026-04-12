@@ -795,43 +795,6 @@ pub fn getOrLoadHandle(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMem
     };
 }
 
-/// Eagerly loads all files transitively reachable via `@import` chains
-/// starting from the given handle. Uses a worklist pattern: each newly
-/// loaded file's imports are also followed. Already-loaded files are skipped
-/// (checked via `handles.get` to avoid awaiting unset futures).
-/// **Not thread safe** — must be called after the handle's future event is set.
-pub fn loadTransitiveImports(self: *DocumentStore, start_handle: *Handle) error{ Canceled, OutOfMemory }!void {
-    // Worklist: index into handles. We process file_imports of each handle
-    // starting from start_handle, loading any unloaded imports.
-    // New handles are appended to `handles` by getOrLoadHandle, so we can
-    // track progress by index. But we need to process imports from specific
-    // handles, not iterate all handles sequentially.
-
-    // Use an explicit worklist of handles to process.
-    var worklist: std.ArrayList(*Handle) = .empty;
-    defer worklist.deinit(self.allocator);
-    try worklist.append(self.allocator, start_handle);
-
-    var i: usize = 0;
-    while (i < worklist.items.len) : (i += 1) {
-        const handle = worklist.items[i];
-        for (handle.file_imports) |import_uri| {
-            // Skip non-file URIs (untitled://, etc.) — can't load from disk
-            if (!import_uri.isFileScheme()) continue;
-            // Skip if already in the store — do NOT call getOrLoadHandle
-            // to check, as it awaits the future (deadlock risk on cycles)
-            if (self.getHandle(import_uri) != null) continue;
-
-            // Load from disk
-            const imported_handle = self.getOrLoadHandle(import_uri) catch |err| switch (err) {
-                error.Canceled, error.OutOfMemory => |e| return e,
-            } orelse continue; // File not on disk — skip
-
-            try worklist.append(self.allocator, imported_handle);
-        }
-    }
-}
-
 /// **Thread safe** takes a shared lock
 /// This function does not protect against data races from modifying the BuildFile
 pub fn getBuildFile(self: *DocumentStore, uri: Uri) ?*BuildFile {
@@ -885,7 +848,7 @@ pub fn openLspSyncedDocument(self: *DocumentStore, uri: Uri, text: []const u8) e
     }
 
     const duped_text = try self.allocator.dupeSentinel(u8, text, 0);
-    const handle = self.createAndStoreDocument(
+    _ = self.createAndStoreDocument(
         uri,
         .{ .text = duped_text },
         .{
@@ -897,8 +860,6 @@ pub fn openLspSyncedDocument(self: *DocumentStore, uri: Uri, text: []const u8) e
         error.Canceled, error.OutOfMemory => |e| return e,
         else => unreachable,
     };
-
-    try self.loadTransitiveImports(handle);
 }
 
 /// Closes a document that has been synced over the LSP protocol (`textDocument/didClose`).
