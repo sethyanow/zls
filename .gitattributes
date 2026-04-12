@@ -2,3 +2,4 @@
 *.zig text=auto eol=lf
 *.zon text=auto eol=lf
 *.json text=auto eol=lf
+.bones/audit.jsonl merge=bones-audit
