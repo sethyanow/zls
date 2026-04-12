@@ -1,11 +1,14 @@
 ---
 id: zls-91m
 title: Implement eager transitive import loading in DocumentStore
-status: open
+status: active
 type: task
 priority: 1
+owner: Seth
 parent: zls-h4v
 ---
+
+
 
 
 
