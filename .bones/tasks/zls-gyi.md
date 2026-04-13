@@ -4,9 +4,10 @@ title: 'Phase 2: Call Hierarchy Implementation'
 status: open
 type: epic
 priority: 1
-depends_on: [zls-h4v]
+depends_on: [zls-h4v, zls-6pm]
 parent: zls-xjj
 ---
+
 
 ## Context
 Parent epic zls-xjj, Phase 2. Depends on Phase 1 (zls-h4v: Cross-File Reference Coverage Fix).

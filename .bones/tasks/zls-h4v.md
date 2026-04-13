@@ -1,12 +1,16 @@
 ---
 id: zls-h4v
 title: 'Phase 1: Cross-File Reference Coverage Fix'
-status: open
+status: closed
 type: epic
 priority: 1
-depends_on: [zls-91m]
+depends_on: [zls-91m, zls-i4z]
 parent: zls-xjj
 ---
+
+
+
+
 
 
 
@@ -23,13 +27,13 @@ This phase fixes the foundation so Phase 2 (call hierarchy) builds on reliable c
 - R7: `findReferences` cross-file coverage shall improve without changes to the references handler itself.
 
 ## Success Criteria
-- [ ] When a file is opened in DocumentStore, all files reachable via `@import` chains are transitively loaded
-- [ ] `gatherWorkspaceReferenceCandidates` loads unresolved imports on-demand as fallback
-- [ ] `findReferences` returns results across all transitively imported files (not just already-opened files)
-- [ ] `zig build test --summary all` passes
-- [ ] `zig build check` compiles clean
-- [ ] `zig fmt --check .` passes
-- [ ] Live LSP demo: `findReferences` on `resolveTypeOfNode` finds callers in 5+ feature files
+- [x] When a file is opened in DocumentStore, all files reachable via `@import` chains are transitively loaded
+- [x] `gatherWorkspaceReferenceCandidates` loads unresolved imports on-demand as fallback
+- [x] `findReferences` returns results across all transitively imported files (not just already-opened files)
+- [x] `zig build test --summary all` passes
+- [x] `zig build check` compiles clean
+- [x] `zig fmt --check .` passes
+- [x] Live LSP demo: `findReferences` on `resolveTypeOfNode` finds callers in all 4 calling feature files (completions, inlay_hints, references, semantic_tokens); `getPositionContext` finds callers in 5 feature files (code_actions, completions, goto, hover, references). Epic body mentioned hover.zig for resolveTypeOfNode — verified via grep that hover.zig doesn't call it; 4 is the ground truth ceiling.
 
 ## Anti-Patterns
 - NO fixing only the build-system path (R5 requires eager loading regardless of build system. Claude Code doesn't configure workspaces.)
@@ -41,16 +45,20 @@ This phase fixes the foundation so Phase 2 (call hierarchy) builds on reliable c
 - `file_imports` on a Handle contains URIs of all `@import`ed files. Following these transitively is the mechanism.
 - `getOrLoadHandle` already handles loading from disk for `file://` URIs. For `untitled://` URIs it just does a lookup.
 - The `HandleIterator` iterates `store.handles` — once eager loading populates this, the fallback path in `gatherWorkspaceReferenceCandidates` automatically benefits.
-- Must not cause infinite loops if there are circular imports (Zig doesn't allow them, but defensive coding).
+- **Circular imports CAN reach the parser.** Zig's compiler rejects circular `@import`s at semantic analysis, but the parser and `collectImports` accept them. R5's eager loading must defend against this — `getOrLoadHandle`'s `await` will deadlock on an in-progress handle's event. Use `ensureHandleLoaded` (added in zls-91m) which uses a non-blocking `contains` check instead.
 - Performance: loading the full import graph happens once per file open, amortized. Zig projects have bounded import graphs.
 
 ## Acceptance Requirements
 **Agent Documentation:** Update stale docs only.
-- [ ] CLAUDE.md: none expected (no new commands or config)
-- [ ] Project docs: none expected
+- [x] CLAUDE.md: none expected (no new commands or config)
+- [x] Project docs: none expected
 
 **User Demo:** Live narrated LSP tool walkthrough.
 - Run `findReferences` on `resolveTypeOfNode` (analysis.zig:1943) — show results now include references.zig, semantic_tokens.zig, inlay_hints.zig (previously missed)
 - Run `findReferences` on `getPositionContext` (analysis.zig:5355) — show it now finds references.zig and code_actions.zig (previously missed)
 - Explain each LSP call as it happens: what's being queried, what the result means, how many files were found vs the prior baseline
 - Show at least one case where a file that was previously missed is now found
+
+## Log
+
+- [2026-04-13T13:09:01Z] [Seth] Phase 1 complete. Live demo passed. Criterion wording corrected: hover.zig does not call resolveTypeOfNode so the 5+ expectation was off by one. 4 is the complete set.

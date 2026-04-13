@@ -738,3 +738,440 @@ fn testSimpleReferences(source: []const u8) !void {
 
     if (has_unvisited) return error.ExpectedReference;
 }
+
+test "eager transitive import loading" {
+    // R5: Opening a file with file:// URI eagerly loads transitive imports.
+    // Fixture chain: a.zig -> b.zig -> c.zig
+    // Open only a.zig, assert c.zig is in the DocumentStore.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/a.zig" });
+    defer allocator.free(a_path);
+    const c_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/c.zig" });
+    defer allocator.free(c_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const c_uri: zls.Uri = try .fromPath(allocator, c_path);
+    defer c_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open only a.zig — do NOT open b.zig or c.zig
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/a.zig"),
+        },
+    });
+
+    // c.zig should be in the store via transitive eager loading: a -> b -> c
+    const c_handle = ctx.server.document_store.getHandle(c_uri);
+    try std.testing.expect(c_handle != null);
+}
+
+test "on-demand import loading in reference search" {
+    // R6: gatherWorkspaceReferenceCandidates fallback path reloads imports
+    // not in the store during the reference search iteration.
+    // Fixture chain: a.zig -> b.zig -> c.zig (all exist on disk).
+    // Open a.zig (R5 loads b and c), purge b.zig, then findReferences on
+    // `value` in c.zig. Analysis resolves `value` locally (no cross-file load).
+    // Without R6: b not iterated, per_file_dependants[c]={}, only c searched.
+    // With R6: a's import of b triggers reload, b iterated, b's import of c
+    // recorded, dependant map complete, b.zig's reference to c.value found.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/b.zig" });
+    defer allocator.free(b_path);
+    const c_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/c.zig" });
+    defer allocator.free(c_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+    const c_uri: zls.Uri = try .fromPath(allocator, c_path);
+    defer c_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open a.zig (R5 eagerly loads b.zig and c.zig)
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/a.zig"),
+        },
+    });
+
+    // Verify b.zig was loaded by R5
+    try std.testing.expect(ctx.server.document_store.getHandle(b_uri) != null);
+
+    // Purge b.zig — the middle of the import chain
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didClose", .{
+        .textDocument = .{ .uri = b_uri.raw },
+    });
+    try std.testing.expect(ctx.server.document_store.getHandle(b_uri) == null);
+
+    // Force the fallback path in gatherWorkspaceReferenceCandidates by
+    // marking handles as having no associated build file. Without this,
+    // file:// URIs inside the project tree find the project's build.zig,
+    // whose config is unresolved async, causing the function to return empty.
+    {
+        var handle_it: zls.DocumentStore.HandleIterator = .{ .store = &ctx.server.document_store };
+        while (handle_it.next()) |handle| {
+            handle.impl.associated_build_file = .none;
+        }
+    }
+
+    // findReferences on `value` defined in c.zig.
+    // Analysis resolves `value` locally in c.zig — no cross-file load triggered.
+    // The fallback path iterates handles (a, c). a's file_imports = [b].
+    // R6 reloads b mid-iteration. b's file_imports = [c] → per_file_dependants[c] = [b].
+    // Dependant walk from c finds b, then a. All three files searched.
+    const c_source = @embedFile("../fixtures/eager_load/c.zig");
+    const value_pos = offsets.indexToPosition(
+        c_source,
+        std.mem.indexOf(u8, c_source, "value").?,
+        ctx.server.offset_encoding,
+    );
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = c_uri.raw },
+            .position = value_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("Server returned `null` for findReferences\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // b.zig references c.value — proving R6 reloaded b and the dependant map is complete
+    var found_b = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, b_uri.raw)) {
+            found_b = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_b);
+}
+
+test "ensureHandleLoaded skips URIs already in store" {
+    // Contract: calling ensureHandleLoaded on a URI that's already in the
+    // handles map must not call getOrLoadHandle (which would await the
+    // future). It must return immediately and not add a duplicate.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/a.zig" });
+    defer allocator.free(a_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open a.zig — adds a (and via R5 b, c) to the store
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/a.zig"),
+        },
+    });
+
+    const count_before = ctx.server.document_store.handles.count();
+    try std.testing.expect(ctx.server.document_store.getHandle(a_uri) != null);
+
+    // Calling ensureHandleLoaded on the existing URI must be a no-op
+    try ctx.server.document_store.ensureHandleLoaded(a_uri);
+
+    const count_after = ctx.server.document_store.handles.count();
+    try std.testing.expectEqual(count_before, count_after);
+    try std.testing.expect(ctx.server.document_store.getHandle(a_uri) != null);
+}
+
+test "ensureHandleLoaded ignores non-file scheme URIs" {
+    // Contract: non-file URIs (untitled://, etc.) cannot be loaded from
+    // disk, so ensureHandleLoaded must be a no-op for them — no error,
+    // no addition to the store.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const fake_uri: zls.Uri = try .parse(ctx.arena.allocator(), "untitled:///does-not-exist.zig");
+
+    const count_before = ctx.server.document_store.handles.count();
+
+    try ctx.server.document_store.ensureHandleLoaded(fake_uri);
+
+    const count_after = ctx.server.document_store.handles.count();
+    try std.testing.expectEqual(count_before, count_after);
+}
+
+test "ensureHandleLoaded loads file:// URIs not in store" {
+    // Contract: calling ensureHandleLoaded on a file:// URI that's not in
+    // the store must load it from disk and add it to the handles map.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const c_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/c.zig" });
+    defer allocator.free(c_path);
+
+    const c_uri: zls.Uri = try .fromPath(allocator, c_path);
+    defer c_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // c.zig is not in the store
+    try std.testing.expect(ctx.server.document_store.getHandle(c_uri) == null);
+
+    try ctx.server.document_store.ensureHandleLoaded(c_uri);
+
+    // Now it is
+    try std.testing.expect(ctx.server.document_store.getHandle(c_uri) != null);
+}
+
+test "adversarial: self-referential import does not deadlock" {
+    // self_ref.zig contains `@import("self_ref.zig")` — a self-loop in
+    // the parsed AST. Zig rejects this at semantic analysis, but the
+    // parser and collectImports both accept it. Before the ensureHandleLoaded
+    // fix, R5's eager loading would call getOrLoadHandle(self_uri) which
+    // would re-enter createAndStoreDocument, find the handle existing with
+    // event unset, and deadlock on the await.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const self_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/self_ref.zig" });
+    defer allocator.free(self_path);
+
+    const self_uri: zls.Uri = try .fromPath(allocator, self_path);
+    defer self_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = self_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/self_ref.zig"),
+        },
+    });
+
+    try std.testing.expect(ctx.server.document_store.getHandle(self_uri) != null);
+}
+
+test "adversarial: circular import chain does not deadlock" {
+    // cycle_a.zig imports cycle_b.zig imports cycle_a.zig.
+    // Zig rejects the cycle at semantic analysis; parser accepts it.
+    // Opening cycle_a should load cycle_b, and cycle_b's eager loading
+    // should hit cycle_a already in store (Option 1 fix: event.set before
+    // recursive loading). ensureHandleLoaded skips via contains check.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/cycle_a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/cycle_b.zig" });
+    defer allocator.free(b_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/cycle_a.zig"),
+        },
+    });
+
+    // Both cycle_a and cycle_b should be loaded
+    try std.testing.expect(ctx.server.document_store.getHandle(a_uri) != null);
+    try std.testing.expect(ctx.server.document_store.getHandle(b_uri) != null);
+}
+
+test "adversarial: import of nonexistent file is handled gracefully" {
+    // R5 eager loading and ensureHandleLoaded must not crash when an
+    // @import points to a file that doesn't exist on disk. getOrLoadHandle
+    // returns null for missing files; ensureHandleLoaded's `_ = try`
+    // swallows the null without propagating.
+
+    const io = std.testing.io;
+
+    // Use an untitled:// URI with inline content that imports a nonexistent file.
+    // This avoids needing a fixture file that imports a phantom.
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Use addDocument which uses untitled:// — eager loading for non-file
+    // schemes is a no-op via isFileScheme early return in ensureHandleLoaded.
+    // For a file:// scenario, we'd need a fixture. Instead, verify the
+    // analogous file:// path using c.zig which exists but with an artificial
+    // "missing" sibling in file_imports.
+    //
+    // Simpler: create a fixture that imports a nonexistent file.
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const parent_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/ghost_parent.zig" });
+    defer allocator.free(parent_path);
+
+    const parent_uri: zls.Uri = try .fromPath(allocator, parent_path);
+    defer parent_uri.deinit(allocator);
+
+    // didOpen must succeed even though ghost_parent imports a nonexistent file
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = parent_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/ghost_parent.zig"),
+        },
+    });
+
+    try std.testing.expect(ctx.server.document_store.getHandle(parent_uri) != null);
+}
+
+test "unresolved build file falls through to fallback path" {
+    // Regression: gatherWorkspaceReferenceCandidates used to return .empty when
+    // a handle's associated_build_file was .unresolved (build runner still
+    // running or failed). With no client refresh signal for references, every
+    // cold-start cross-file query in a build.zig project returned empty until
+    // the background worker happened to finish. Fix falls through to the
+    // fallback path (same behaviour as .none) so Phase 1's eager-loaded handles
+    // get walked regardless of build config state.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/eager_load/b.zig" });
+    defer allocator.free(b_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open a.zig — R5 eager loading pulls b.zig and c.zig into the store.
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/eager_load/a.zig"),
+        },
+    });
+
+    try std.testing.expect(ctx.server.document_store.getHandle(b_uri) != null);
+
+    // Construct a fake BuildFile whose impl.config is null. isAssociatedWith
+    // will hit `tryLockConfig orelse return .unknown`, so getAssociatedBuildFile
+    // returns .unresolved on every call — the exact state that used to cause
+    // the early-bail.
+    const fake_uri: zls.Uri = try .fromPath(allocator, a_path);
+    var fake_bf = zls.DocumentStore.BuildFile{ .uri = fake_uri };
+    defer fake_bf.uri.deinit(allocator);
+
+    // Force every loaded handle into the .unresolved state pointing at the
+    // fake build file. Each handle's AssociatedBuildFile.State.deinit (via
+    // the store's handle deinit) will free the slice and bitset we allocate
+    // here.
+    {
+        var handle_it: zls.DocumentStore.HandleIterator = .{ .store = &ctx.server.document_store };
+        while (handle_it.next()) |handle| {
+            const potential = try allocator.alloc(*zls.DocumentStore.BuildFile, 1);
+            potential[0] = &fake_bf;
+            const checked = try std.DynamicBitSetUnmanaged.initEmpty(allocator, 1);
+            handle.impl.associated_build_file = .{ .unresolved = .{
+                .potential_build_files = potential,
+                .has_been_checked = checked,
+            } };
+        }
+    }
+
+    // findReferences on `doubled` declared in b.zig. a.zig contains `b.doubled`.
+    // Before fix: .unresolved → return .empty → only the definition in b.zig.
+    // After fix:  falls through to fallback → a.zig walked → reference found.
+    const b_source = @embedFile("../fixtures/eager_load/b.zig");
+    const doubled_pos = offsets.indexToPosition(
+        b_source,
+        std.mem.indexOf(u8, b_source, "doubled").?,
+        ctx.server.offset_encoding,
+    );
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = b_uri.raw },
+            .position = doubled_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("Server returned `null` for findReferences\n", .{});
+        return error.InvalidResponse;
+    };
+
+    var found_a = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, a_uri.raw)) {
+            found_a = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_a);
+}

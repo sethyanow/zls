@@ -795,6 +795,37 @@ pub fn getOrLoadHandle(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMem
     };
 }
 
+/// Ensures the document at `uri` is present in the store without awaiting an
+/// in-progress load. Unlike `getOrLoadHandle`, this is safe to call from
+/// within recursive document loading (e.g. eager transitive imports) because
+/// it never blocks on a handle whose creation hasn't completed yet.
+///
+/// If the URI is already in the handles map — regardless of whether its
+/// loading has finished — this returns immediately. Otherwise it triggers a
+/// fresh load via `getOrLoadHandle`.
+///
+/// Non-file-scheme URIs (e.g. `untitled://`) cannot be loaded from disk and
+/// are treated as no-ops.
+///
+/// Only propagates `Canceled` / `OutOfMemory`; other load errors are silently
+/// swallowed (matching `getOrLoadHandle`'s null-return semantics).
+///
+/// **Thread safe** takes an exclusive lock briefly for the contains check.
+pub fn ensureHandleLoaded(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMemory }!void {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    if (!uri.isFileScheme()) return;
+
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.handles.contains(uri)) return;
+    }
+
+    _ = try self.getOrLoadHandle(uri);
+}
+
 /// **Thread safe** takes a shared lock
 /// This function does not protect against data races from modifying the BuildFile
 pub fn getBuildFile(self: *DocumentStore, uri: Uri) ?*BuildFile {
@@ -1667,8 +1698,25 @@ fn createAndStoreDocument(
         store.allocator,
     );
     old_handle.deinit(store.allocator);
-
     handle_future.err = null;
+
+    // Signal that this handle is fully loaded BEFORE triggering eager
+    // transitive loading. This way, if the recursive load chain somehow
+    // routes back to this URI (defensive — Zig disallows circular
+    // @imports), any waiters see a ready handle rather than deadlocking
+    // on an unset event. The existing `defer` at the top of this block
+    // will no-op on function return (Event.set is idempotent).
+    handle_future.event.set(store.io);
+
+    // Eagerly load transitive imports (R5).
+    // Uses ensureHandleLoaded (not getOrLoadHandle) so this function is
+    // safe to call recursively — ensureHandleLoaded never awaits an
+    // in-progress load, it only triggers fresh loads for URIs absent
+    // from the store.
+    for (handle_future.handle.file_imports) |import_uri| {
+        try store.ensureHandleLoaded(import_uri);
+    }
+
     return &handle_future.handle;
 }
 

@@ -4,8 +4,11 @@ title: Call Hierarchy + Cross-File Reference Coverage for ZLS
 status: open
 type: epic
 priority: 1
-depends_on: [zls-h4v, zls-gyi]
+depends_on: [zls-h4v, zls-gyi, zls-6pm]
 ---
+
+
+
 
 
 
@@ -203,3 +206,7 @@ ZLS lacks call hierarchy support (`textDocument/prepareCallHierarchy`, `callHier
 | R5 (eager loading) + R6 (on-demand fallback) | DocumentStore + gatherWorkspaceReferenceCandidates | Yes | Belt and suspenders — eager catches forward imports, on-demand catches anything missed |
 | R7 (findReferences benefits) + R8 (Builder extension) | references.zig Builder | Yes | Builder extension enriches data without changing existing output format. findReferences ignores new fields. |
 | R8 (unified codepath) + R1-R3 (call hierarchy) | references.zig + call_hierarchy.zig | Yes | Builder produces enriched data, call_hierarchy.zig consumes it. call_hierarchy.zig does not duplicate resolution logic. |
+
+## Log
+
+- [2026-04-13T12:37:11Z] [Seth] Adversarial finding (out of zls-91m scope): analysis.zig:resolveImportString and gatherWorkspaceReferenceCandidates build-system path (lines 358-364) still use getOrLoadHandle which awaits. Not currently triggered by recursive scenarios, but they're potential deadlock vectors if any future code path runs them during an in-progress createAndStoreDocument. Consider migrating to ensureHandleLoaded in a follow-up task.

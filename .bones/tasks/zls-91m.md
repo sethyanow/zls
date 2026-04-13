@@ -1,11 +1,16 @@
 ---
 id: zls-91m
 title: Implement eager transitive import loading in DocumentStore
-status: open
+status: closed
 type: task
 priority: 1
+owner: Seth
 parent: zls-h4v
 ---
+
+
+
+
 
 
 ## Context
@@ -28,7 +33,7 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 
 **R5 test (eager loading):** Check into repo: `tests/fixtures/eager_load/{a.zig, b.zig, c.zig}` with import chain a→b→c. Open `a.zig` via `textDocument/didOpen` with `file://` URI. Assert `b.zig` and `c.zig` are in the DocumentStore. This tests DocumentStore behavior, not references.
 
-**R6 test (on-demand fallback):** Same fixture structure but with a late-arriving file. Open `a.zig` when `b.zig` exists but `c.zig` does NOT exist on disk. R5 eager-loads `b.zig`, but `b.zig`'s import of `c.zig` fails (not found). Then create `c.zig` on disk (simulating build output, e.g. Bazel generating comptime bindings). Run findReferences — R6 discovers `c.zig` on-demand during the search. Assert `c.zig` is now in the store.
+**R6 test (on-demand fallback):** Same fixture files. Exercise the `gatherWorkspaceReferenceCandidates` fallback path (no build system) with `file://` URIs. The on-demand loading code in the fallback path calls `getOrLoadHandle` for `file_imports` URIs not yet in the store, loading them during the reference search. Assert that findReferences discovers cross-file results via the on-demand path.
 
 **R7 test:** Already covered by existing cross-file tests at `references.zig:304-351` using `untitled://` infrastructure. Once R5/R6 ensure files are loaded, findReferences works without changes. No new test needed.
 
@@ -38,7 +43,7 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 
 2. **Write R5 test** — in `tests/lsp_features/references.zig`. Open `a.zig` with `file://` URI. Assert transitive imports loaded.
 
-3. **Write R6 test** — in `tests/lsp_features/references.zig`. Open `a.zig` when `c.zig` missing, create `c.zig`, run findReferences, assert on-demand load.
+3. **Write R6 test** — in `tests/lsp_features/references.zig`. Exercise the on-demand loading in the fallback path using the same fixture files. Assert findReferences discovers cross-file results.
 
 4. **DocumentStore eager loading** — in `src/DocumentStore.zig`, after `file_imports` are computed for a handle (around the `collectImports` / `updateFileImports` area), iterate the new `file_imports` and call `getOrLoadHandle` for each URI not already in `handles`. Since `getOrLoadHandle` triggers parsing which computes `file_imports` for the newly loaded file, this naturally cascades. Guard against cycles with a visited set or by checking `handles.contains(uri)` before loading (which `getOrLoadHandle` already does — it returns the existing handle if present).
 
@@ -47,22 +52,24 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 6. **Verify all tests pass** — `zig build test --summary all`, `zig build check`, `zig fmt --check .`
 
 ## Success Criteria
-- [ ] R5 test: opening a file loads its transitive imports into DocumentStore
-- [ ] R6 test: on-demand fallback loads late-arriving files during reference search
-- [ ] R7: existing cross-file reference tests still pass (no changes to references handler)
-- [ ] Each test fails before its corresponding implementation (red step verified)
-- [ ] DocumentStore eagerly loads transitive imports on file open
-- [ ] gatherWorkspaceReferenceCandidates loads unresolved imports on-demand
-- [ ] `zig build test --summary all` passes (all existing tests still green)
-- [ ] `zig build check` compiles clean
-- [ ] `zig fmt --check .` passes
+- [x] R5 test: opening a file loads its transitive imports into DocumentStore
+- [x] R6 test: on-demand fallback loads imports not in store during reference search (purge-and-reload scenario)
+- [x] R7: existing cross-file reference tests still pass (no changes to references handler)
+- [x] Each test fails before its corresponding implementation (red step verified)
+- [x] DocumentStore eagerly loads transitive imports on file open
+- [x] gatherWorkspaceReferenceCandidates loads unresolved imports on-demand
+- [x] `zig build test --summary all` passes (all existing tests still green)
+- [x] `zig build check` compiles clean
+- [x] `zig fmt --check .` passes
+- [x] `ensureHandleLoaded` API added to DocumentStore (deadlock fix for recursive loading)
+- [x] Adversarial tests added: self-referential import, circular chain, missing file
 
 ## Anti-Patterns
 - NO modifying the references handler (R7: fix is in DocumentStore and gatherWorkspaceReferenceCandidates only)
 - NO artificial loading limits (R5: unbounded transitive loading)
 - NO writing implementation before the test fails (TDD: red-green-refactor)
 - NO mashing multiple requirements into one test (each R gets its own)
-- NO runtime temp file creation for test fixtures (check fixture files into the repo)
+- NO runtime file creation of any kind in tests (all test data is checked-in fixtures — no exceptions, no "but the scenario requires it")
 
 ## Key Considerations
 
@@ -71,6 +78,9 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 - **getOrLoadHandle returns null:** File not on disk. Skip gracefully, continue to next import.
 - **Error propagation:** `getOrLoadHandle` returns `error.Canceled` or `error.OutOfMemory`. Propagate these (resource exhaustion / shutdown). All other errors return null.
 - **Cycle safety:** `getOrLoadHandle` returns existing handle if present, so re-visiting a URI is a no-op.
+- **Recursive call stack (adversarial):** Eager loading is recursive: `getOrLoadHandle` → `createAndStoreDocument` → parse → `updateFileAndTree` → eager loading fires again. Stack depth = import chain depth (not total file count). ~20-50 levels max for real Zig projects. Accept per R5; convert to iterative worklist only if stack overflow reported.
+- **didOpen latency (adversarial):** Eager loading adds blocking I/O to file open. 100 imports × slow disk = noticeable lag. Inherent to the design — on-demand-only shifts latency to first analysis instead. Accept per R5.
+- **Double execution is safe (adversarial):** `didOpen` then `didChange` both trigger eager loading. Second pass calls `getOrLoadHandle` on already-loaded URIs which returns existing handles. No-op by design.
 
 ## Key Files
 - `src/DocumentStore.zig` — primary change: eager loading after file_imports computed
@@ -81,3 +91,5 @@ Additionally, `gatherWorkspaceReferenceCandidates` gets an on-demand fallback to
 ## Log
 
 - [2026-04-12T12:43:02Z] [Seth] SRE refinement: Split monolithic test into three per-requirement tests. R5 (eager loading) and R6 (on-demand) use file:// fixtures checked into repo. R6 scenario: late-arriving file simulating Bazel-generated comptime bindings. R7 already covered by existing untitled:// cross-file tests. No changes to implementation steps 2-3.
+- [2026-04-12T17:28:02Z] [Seth] Fixed skeleton inconsistency: R6 test description said 'create c.zig on disk' which contradicted anti-pattern 'no runtime file creation'. Next session exploited this as a loophole. R6 test now uses same checked-in fixture files as R5 — isolation comes from exercising different code paths, not different file states.
+- [2026-04-13T12:40:04Z] [Seth] Implementation complete. Key changes: (1) Added ensureHandleLoaded API on DocumentStore — non-blocking contains check then getOrLoadHandle if absent. (2) R5 eager loading uses ensureHandleLoaded + early event.set (Option 1 + Option 3 defense in depth). (3) R6 fallback uses ensureHandleLoaded. (4) Adversarial tests: self-referential import, circular chain, missing file. (5) Test fixtures checked into tests/fixtures/eager_load/. Critical lesson: original adversarial planning marked circular imports as 'safe (Zig disallows)' — wrong because parser accepts them. The deadlock lived in that gap. Saved lesson to feedback memory.

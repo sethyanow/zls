@@ -334,8 +334,13 @@ fn gatherWorkspaceReferenceCandidates(
 ) Analyser.Error!Uri.ArrayHashMap(void) {
     if (DocumentStore.supports_build_system) no_build_file: {
         const resolved = switch (try root_handle.getAssociatedBuildFile(store)) {
-            .unresolved => return .empty, // this should await instead
-            .none => break :no_build_file,
+            // .unresolved means the build runner hasn't populated config yet.
+            // No refresh signal is sent to the client for references, so we
+            // can't rely on a retry. Fall through to the fallback path
+            // (Phase 1's eager-loaded handles) instead of returning empty —
+            // too many results is recoverable, an empty set is not.
+            // Long-term fix: await the build config via an Event on BuildFile.
+            .unresolved, .none => break :no_build_file,
             .resolved => |resolved| resolved,
         };
 
@@ -371,6 +376,13 @@ fn gatherWorkspaceReferenceCandidates(
     var it: DocumentStore.HandleIterator = .{ .store = store };
     while (it.next()) |handle| {
         for (handle.file_imports) |import_uri| {
+            // On-demand loading (R6): load imports not yet in the store.
+            // Newly loaded handles are appended to the ArrayHashMap and
+            // visited later in this same iteration. Uses ensureHandleLoaded
+            // to avoid awaiting handles that are still being created
+            // (which would deadlock inside the iteration).
+            try store.ensureHandleLoaded(import_uri);
+
             const gop = try per_file_dependants.getOrPutValue(arena, import_uri, .empty);
             try gop.value_ptr.append(arena, handle.uri);
         }
