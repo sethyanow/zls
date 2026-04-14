@@ -126,6 +126,116 @@ test "prepare on anonymous fn expression returns null" {
     , &.{});
 }
 
+// -----------------------------------------------------------------------------
+// Adversarial battery (post-implementation stress tests)
+// -----------------------------------------------------------------------------
+
+test "prepare: nested fn_decl — innermost wins" {
+    // Inner fn declared inside an outer fn's container expression.
+    // Per design, innermost callable matches when position is inside the inner fn.
+    try testPrepare(
+        \\fn outer() void {
+        \\    const helper = struct {
+        \\        fn <>inner() void {}
+        \\    };
+        \\    _ = helper;
+        \\}
+    , &.{
+        .{
+            .name = "inner",
+            .kind = .Function,
+            .range_text = "fn inner() void {}",
+            .selection_text = "inner",
+        },
+    });
+}
+
+test "prepare: position on function name token matches the fn" {
+    // Click on `foo` directly (name token), not inside body.
+    try testPrepare(
+        \\fn fo<>o() void {}
+    , &.{
+        .{
+            .name = "foo",
+            .kind = .Function,
+            .range_text = "fn foo() void {}",
+            .selection_text = "foo",
+        },
+    });
+}
+
+test "prepare: quoted identifier with multi-byte chars" {
+    // `@"αβ"` is a valid Zig identifier; name is the full @-quoted token slice.
+    try testPrepare(
+        \\fn @"<>αβ"() void {}
+    , &.{
+        .{
+            .name = "@\"αβ\"",
+            .kind = .Function,
+            .range_text = "fn @\"αβ\"() void {}",
+            .selection_text = "@\"αβ\"",
+        },
+    });
+}
+
+test "prepare: recursive self-call inside comptime block" {
+    // A function that calls itself — ensure the fn_decl is matched, not the call site.
+    try testPrepare(
+        \\fn rec() void { <>rec(); }
+    , &.{
+        .{
+            .name = "rec",
+            .kind = .Function,
+            .range_text = "fn rec() void { rec(); }",
+            .selection_text = "rec",
+        },
+    });
+}
+
+test "prepare: function named `comptime` does not collide with comptime-block handling" {
+    // Semantically hostile: a fn whose name IS the string literal we use for comptime blocks.
+    try testPrepare(
+        \\fn @"<>comptime"() void {}
+    , &.{
+        .{
+            .name = "@\"comptime\"",
+            .kind = .Function,
+            .range_text = "fn @\"comptime\"() void {}",
+            .selection_text = "@\"comptime\"",
+        },
+    });
+}
+
+test "prepare: idempotent — two prepares on the same position return equivalent items" {
+    var phr = try helper.collectClearPlaceholders(allocator, "fn <>foo() void {}");
+    defer phr.deinit(allocator);
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    const params: types.call_hierarchy.PrepareParams = .{
+        .textDocument = .{ .uri = test_uri.raw },
+        .position = position,
+    };
+    const first = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/prepareCallHierarchy", params);
+    const second = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/prepareCallHierarchy", params);
+
+    const a = (first orelse return error.InvalidResponse)[0];
+    const b = (second orelse return error.InvalidResponse)[0];
+
+    try std.testing.expectEqualStrings(a.name, b.name);
+    try std.testing.expectEqual(a.kind, b.kind);
+    try std.testing.expectEqualStrings(a.uri, b.uri);
+    try std.testing.expectEqual(a.range.start.line, b.range.start.line);
+    try std.testing.expectEqual(a.range.end.character, b.range.end.character);
+
+    const a_node = a.data.?.object.get("node").?.integer;
+    const b_node = b.data.?.object.get("node").?.integer;
+    try std.testing.expectEqual(a_node, b_node);
+}
+
 test "CallHierarchyItem.data round-trips through lsp_kit serialization" {
     // Exercise the same JSON path the LSP transport uses: std.json.Stringify.valueAlloc
     // (cf. src/Server.zig:207, src/DiagnosticsCollection.zig:296).
