@@ -7,6 +7,7 @@ priority: 1
 parent: zls-gyi
 ---
 
+
 ## Dependency Gates
 - **Blocked by:** none (Phase 1 sub-epic zls-h4v is closed; seam contract delivered — eager transitive loading available but not required for prepare)
 - **Unlocks:** Phase 2 Task 2 (incomingCalls) and Phase 2 Task 3 (outgoingCalls) — both consume CallHierarchyItem produced here
@@ -83,8 +84,9 @@ TDD cycle throughout: test first, run to observe failure, implement, observe pas
 **Run:** `zig build test -Dtest-filter="call_hierarchy" --summary all` (NOTE: file not yet registered, so it won't run — proceed to step 2 to register it)
 
 ### Step 2: Register the new test file in tests/tests.zig
-**File:** `tests/tests.zig:22` (alphabetical position between `references.zig` and `selection_range.zig`)
-**Change:** Add `_ = @import("lsp_features/call_hierarchy.zig");` line. One-line insertion.
+**File:** `tests/tests.zig:13` (alphabetical position at the top of the LSP features block, BEFORE `code_actions.zig` — `call_hierarchy` sorts before `code_actions` because `c-a-l` precedes `c-o-d`)
+**Change:** Insert `_ = @import("lsp_features/call_hierarchy.zig");` as the new line 13, pushing `code_actions.zig` to line 14 and all following LSP-feature lines down by one. One-line insertion.
+**SRE note (2026-04-14):** The prior skeleton revision cited line 22 "between references.zig and selection_range.zig" — that was wrong. The correct position is line 13 to preserve the alphabetical sort.
 **Run:** `zig build test -Dtest-filter="call_hierarchy" --summary all`
 **Expected failure:** compilation error because `call_hierarchy.zig` will reference `sendRequestSync("textDocument/prepareCallHierarchy", ...)` which requires the method to be registered in `HandledRequestParams`. OR runtime error "method not found" returning null from `.other`.
 
@@ -239,3 +241,7 @@ Single-file fixtures only for this task. Cross-file infrastructure (import relat
 - `callHierarchyProvider` capability advertisement (flipped by the task that ships all three handlers)
 - Live narrated LSP demo (Phase 2 acceptance task after all three implementation tasks close)
 - Cross-file test fixtures and multi-document test infrastructure (Task 2/3)
+
+## Log
+
+- [2026-04-14T19:33:21Z] [Seth] SRE fresh-session review (2026-04-14, all 10 categories applied). Findings: ONE factual error in Step 2 — incorrect tests.zig insertion line (cited line 22 between references/selection_range; correct position is line 13 before code_actions because 'call_hierarchy' < 'code_actions' alphabetically). Fixed in skeleton. All other claims spot-checked pass: Server.zig handler line numbers (1467/1574/1584/1588/1630/1794/1803-1827), HandledRequestParams union, isBlockingMessage non-blocking list (1636-1657), sendRequestSync dispatch, CallBuilder @ references.zig:556, innermostScopeAtIndexWithTag @ analysis.zig:6221, offsets.{nodeToRange,tokenToRange,positionToIndex}, AST tag references, tree.fullCall convention (4 tags), Server.Error pub @ line 98, selection_range.zig test pattern. Requirement/criteria bijection verified. No placeholders. Ready for adversarial-planning.
