@@ -116,6 +116,16 @@ test "prepare on top-level variable declaration returns null" {
     , &.{});
 }
 
+test "prepare on anonymous fn expression returns null" {
+    // `const f = fn() void {}` is an anonymous fn literal — the fn_proto has no
+    // name_token. Per the adversarial catalog, Task 1 skips these; future work
+    // could resolve to the enclosing var decl's name.
+    try testPrepare(
+        \\const f = fn() void {<>};
+        \\comptime { _ = f; }
+    , &.{});
+}
+
 test "CallHierarchyItem.data round-trips through lsp_kit serialization" {
     // Exercise the same JSON path the LSP transport uses: std.json.Stringify.valueAlloc
     // (cf. src/Server.zig:207, src/DiagnosticsCollection.zig:296).
