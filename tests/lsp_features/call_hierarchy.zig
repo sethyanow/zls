@@ -116,6 +116,64 @@ test "prepare on top-level variable declaration returns null" {
     , &.{});
 }
 
+test "CallHierarchyItem.data round-trips through lsp_kit serialization" {
+    // Exercise the same JSON path the LSP transport uses: std.json.Stringify.valueAlloc
+    // (cf. src/Server.zig:207, src/DiagnosticsCollection.zig:296).
+    // The `data` field carries URI + node_index across prepare → incoming/outgoing, so
+    // this is the handoff Task 2/3 relies on.
+    var phr = try helper.collectClearPlaceholders(allocator, "fn <>foo() void {}");
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    const params: types.call_hierarchy.PrepareParams = .{
+        .textDocument = .{ .uri = test_uri.raw },
+        .position = position,
+    };
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        params,
+    );
+    const items = response orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const original_item = items[0];
+
+    // Round-trip: serialize the full Item, then parse it back.
+    const json_bytes = try std.json.Stringify.valueAlloc(
+        ctx.arena.allocator(),
+        original_item,
+        .{ .emit_null_optional_fields = false },
+    );
+
+    const parsed = try std.json.parseFromSlice(
+        types.call_hierarchy.Item,
+        ctx.arena.allocator(),
+        json_bytes,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings(original_item.name, parsed.value.name);
+    try std.testing.expectEqualStrings(original_item.uri, parsed.value.uri);
+
+    const data = parsed.value.data orelse return error.DataFieldDropped;
+    try std.testing.expect(data == .object);
+    const obj = data.object;
+
+    const uri_value = obj.get("uri") orelse return error.UriFieldMissing;
+    try std.testing.expect(uri_value == .string);
+    try std.testing.expectEqualStrings(test_uri.raw, uri_value.string);
+
+    const node_value = obj.get("node") orelse return error.NodeFieldMissing;
+    try std.testing.expect(node_value == .integer);
+    try std.testing.expect(node_value.integer >= 0);
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
