@@ -8,6 +8,7 @@ parent: zls-gyi
 ---
 
 
+
 ## Dependency Gates
 - **Blocked by:** none (Phase 1 sub-epic zls-h4v is closed; seam contract delivered — eager transitive loading available but not required for prepare)
 - **Unlocks:** Phase 2 Task 2 (incomingCalls) and Phase 2 Task 3 (outgoingCalls) — both consume CallHierarchyItem produced here
@@ -184,7 +185,8 @@ Expected: Item with `name = "comptime"`, `kind = .function`, `selectionRange` = 
 - [ ] Test: prepareCallHierarchy on `.@"comptime"` block containing a call returns one Item
 - [ ] Test: prepareCallHierarchy on `.@"comptime"` block with no calls returns null
 - [ ] Test: prepareCallHierarchy on non-callable position (whitespace, variable decl) returns null
-- [ ] Test: CallHierarchyItem.data round-trips `{uri, node}` through JSON serialization
+- [ ] Test: prepareCallHierarchy on anonymous fn expression (`const f = fn() void {};` at position inside the fn literal) returns null (decision from adversarial catalog: skip, document as future work)
+- [ ] Test: CallHierarchyItem.data round-trips `{uri, node}` through lsp_kit's LSPAny serialization path (NOT raw std.json) — mandatory test, must pass before moving past Step 10
 - [ ] `src/features/call_hierarchy.zig` exports `prepareHandler` matching the expected Error!?[]const Item signature
 - [ ] `src/Server.zig` registers `@"textDocument/prepareCallHierarchy"` in `HandledRequestParams`, `isBlockingMessage`, `sendRequestSync`, plus a thin wrapper `prepareCallHierarchyHandler`
 - [ ] `zig build test --summary all` passes
@@ -233,6 +235,128 @@ Single-file fixtures only for this task. Cross-file infrastructure (import relat
 ### Pre-existing CallBuilder coexists
 `src/features/references.zig:556 CallBuilder` is used by `callsiteReferences`. It is NOT modified in this task — Task 2 (incomingCalls) will assess whether to unify per R8 or route incomingCalls through a wider Builder extension. Task 1 leaves the existing codepath untouched.
 
+### Adversarial Failure Catalog (2026-04-14)
+
+Produced before implementation — findings grouped by component so the executing agent has failure modes in working memory while writing code.
+
+#### AST walk / enclosing-callable detection
+
+**Input Hostility — position beyond EOF**
+- Assumption: `request.position` resolves to a byte index inside `handle.tree.source`.
+- Betrayal: Client sends a stale position (line 1000 in a 10-line file) due to didChange race or UI lag.
+- Consequence: `positionToIndex` returns a clamped/invalid index; walking AST from there either lands on the root node or panics.
+- Mitigation: Use `offsets.positionToIndex` (the existing convention — it is the re-export from lsp_kit). Its behavior is the source of truth; do NOT write custom bounds-checking. If the resulting index yields no callable ancestor, return null rather than the root node.
+
+**Input Hostility — parse errors in source**
+- Assumption: `handle.tree` is fully parsed and every callable node is well-formed.
+- Betrayal: User saves mid-edit; tree has error nodes; fn_decl's body region is malformed.
+- Consequence: `tree.fullFnProto(&buf, fn_node)` may still succeed (prototype parses independently), but `nodeToRange` on a malformed node could yield odd end-tokens.
+- Mitigation: Partial AST is normal ZLS operating mode. Token indices are always valid (they're produced by the tokenizer, not the parser). `nodeToRange` works on tokens. No special-casing needed — partial trees produce partial-but-safe Items.
+
+**Resource Exhaustion — walk depth**
+- Assumption: AST nesting is shallow in practice.
+- Betrayal: Pathological nesting (500 `if` levels) in an adversarial test fixture.
+- Consequence: Recursive walk stack-overflows; iterative walk with full ancestor list allocates O(depth).
+- Mitigation: Walk iteratively. Return the FIRST callable encountered while ascending (innermost wins) — never collect the full ancestor path. Track one current node + one parent node pointer only.
+
+*State corruption: skipped — walk reads the tree, no persistent or shared state is written.*
+
+#### Callable detection (tag → fullFnProto extraction)
+
+**Input Hostility — fullFnProto unwrap without tag verification**
+- Assumption: If the AST walk identified a node as callable, `tree.fullFnProto(&buf, node).?` is non-null.
+- Betrayal: A refactor changes the tag filter to include a non-fn tag (e.g., `.container_decl`); the `.?` panics.
+- Consequence: Server crashes this request; LSP client sees InternalError; no graceful degradation.
+- Mitigation: Use `switch (tree.nodeTag(node))` as the top-level discriminant. Only call `fullFnProto` inside arms that match `.fn_decl` / `.fn_proto*`. Do NOT unwrap `fullFnProto` outside a tag-verified arm. For `.test_decl` and `.@"comptime"`, do not call fullFnProto at all — they have different extraction paths.
+
+**Input Hostility — anonymous fn expressions**
+- Assumption: Every fn_decl / fn_proto has a name_token.
+- Betrayal: `const f = fn() void {};` parses as a fn_proto with no name (the name lives on the enclosing `.simple_var_decl`).
+- Consequence: `fullFnProto(...).?.name_token.?` panics on the inner unwrap; or Item constructed with empty name is useless to the client.
+- Mitigation: **Decision for Task 1: skip anonymous fn exprs — if `name_token == null`, continue walking up (the enclosing var_decl or block is the next-higher candidate, and probably itself not callable). Document as "fn exprs assigned to const/var are not prepareable via this task; future work could resolve to the owning decl's name." Add a test asserting null for anonymous fn exprs.
+
+**Input Hostility — quoted identifier names**
+- Assumption: `tree.tokenSlice(name_token)` returns the identifier text without Zig's `@"..."` wrapper.
+- Betrayal: For `fn @"weird name"() void {}`, tokenSlice returns the full `@"weird name"` literal (including `@`, quotes, spaces).
+- Consequence: Item.name displayed with raw wrapper characters; test assertions against bare `weird name` fail.
+- Mitigation: Match the existing ZLS convention (document_symbol.zig uses tokenSlice directly without stripping — the client renders whatever it receives). Tests should use ordinary identifiers unless explicitly covering the quoted-name path.
+
+*Temporal / resource / encoding boundaries: skipped — detection is pure AST read, no concurrency and no encoding conversion happens here.*
+
+#### comptime block call detection
+
+**Resource Exhaustion — block walk cost**
+- Assumption: Walking the comptime block body is bounded by block size.
+- Betrayal: A `comptime` block with 10,000 nested expressions (pathological but legal).
+- Consequence: O(N) traversal; slow on pathological inputs.
+- Mitigation: **Short-circuit on the first call encountered.** We only need existence, not a count. Walk depth-first; return Item as soon as `tree.fullCall(&buf, node)` succeeds for any descendant. Do NOT precompute "all comptime blocks with calls" — that's premature optimization and wastes work on blocks that are never prepared.
+
+**Input Hostility — async_call variants in comptime**
+- Assumption: Matching `.call`, `.call_comma`, `.call_one`, `.call_one_comma` covers all calls.
+- Betrayal: A comptime block contains only `async foo();` — the tags are `.async_call*`, not matched.
+- Consequence: Block is (incorrectly) treated as "no calls, return null."
+- Mitigation: **Rare in practice** — async has limited Zig adoption and comptime-async combinations are pathological. Follow the existing ZLS convention (same 4 tags as `ast.zig:691-694`). Document this limitation in a code comment; don't expand the scope for this task.
+
+*Dependency / temporal / encoding / state: skipped — pure AST traversal, no external calls or persistent state.*
+
+#### CallHierarchyItem construction
+
+**Input Hostility — selectionRange not strictly contained in range**
+- Assumption: `selectionRange` ⊂ `range` (LSP spec mandate).
+- Betrayal: A subtle off-by-one — `selectionRange.end.character` == `range.end.character` without the intervening `range.end.line` covering it.
+- Consequence: Some LSP clients reject the Item as spec-violating; silent feature breakage for certain editors.
+- Mitigation: Use `tokenToRange` for the name token (always at most a single line, contained within the enclosing node's range by construction). For comptime, selectionRange = `comptime` keyword's tokenToRange, which is the first token of the node — containment holds trivially. Test assertion compares the serialized range strings literally — catches bugs.
+
+*Resource / encoding / temporal / state: skipped — field assignments with arena-backed strings; covered by per-request arena lifetime.*
+
+#### data field encoding (LSPAny)
+
+**Dependency Treachery — lsp_kit serialization shape rejection**
+- Assumption: `std.json.Value.object` with `{uri: string, node: integer}` round-trips through lsp_kit's LSPAny serializer.
+- Betrayal: lsp_kit uses a stricter shape, or integers beyond a certain range (e.g., rejects values above 2^53 for JS-safety).
+- Consequence: Encoded data is silently dropped on the wire; Task 2/3 decode receives null; node_index lost.
+- Mitigation: **Step 10's round-trip test is mandatory and must exercise lsp_kit's actual serialization path, not raw std.json.** If the round-trip fails, the encoding shape must change (e.g., encode node as a string `"N"` instead of integer). Do NOT move on from Step 10 until the round-trip passes.
+
+**Input Hostility — Ast.Node.Index representation (0.15)**
+- Assumption: `@intFromEnum(node)` produces a u32 that round-trips through JSON integer.
+- Betrayal: Node.Index in 0.15 is a non-exhaustive enum with `.root = 0`; `@intFromEnum` works, but the reverse (`@enumFromInt`) during Task 2 decode must handle values up to the tree's node count.
+- Consequence: Task 1: no issue. Task 2 decode of a very high index could trigger safety checks.
+- Mitigation: Task 1 encodes correctly. Task 2 will clamp / validate on decode. Current task: just verify `@intFromEnum` compiles and round-trips (Step 10).
+
+*Temporal / resource / state: skipped — single in-memory encoding per request.*
+
+#### Task-2/3 forward dependency: node_index staleness
+
+**Temporal Betrayal — Item.data stale after didChange**
+- Assumption: Client calls `incomingCalls(item)` with the same doc state that produced `item`.
+- Betrayal: User edits the file between prepare and incomingCalls; Zig re-parses; node indices are renumbered — the encoded node N now points to a completely different AST node.
+- Consequence: Task 2/3 would operate on the wrong callable (semantic silent corruption).
+- Mitigation: **Task 2/3's responsibility, not Task 1's.** Task 2/3 must validate the decoded node by re-checking `(tag, name)` match before treating it as the callable. Task 1's responsibility is stable encoding within a single protocol exchange. Document this handoff in Task 2's skeleton when scoping it.
+
+#### Server.zig wiring
+
+**State Corruption — Forgetting one of the 4 registration sites**
+- Assumption: A new method only needs registering in HandledRequestParams.
+- Betrayal: Registering in the union but missing `isBlockingMessage` means the request runs on the blocking thread (wrong queue); missing `sendRequestSync` arm means the method falls through to `.other` and returns null silently.
+- Consequence: Silent null returns or incorrect threading — neither fails loudly.
+- Mitigation: **The 4 sites in Step 3 are exhaustive and ordered. Verify with `zig build check` after each site — compile errors surface missing sites quickly.** The Step 4 test (handler returns null) catches the full wiring chain: if it runs without "method not found" but returns the expected null, the union + dispatch wire is correct.
+
+**Input Hostility — `Error!?[]const Item` vs `[]Item` slice layout**
+- Assumption: Returning `&.{item}` literal works for a single-element slice.
+- Betrayal: `&.{item}` produces a pointer to a stack-allocated array; returning it past the function's stack frame is a use-after-scope.
+- Consequence: Garbage data in the LSP response.
+- Mitigation: Use `arena.dupe(Item, &.{item})` to copy into the request arena. The arena lives for the full response's serialization. Existing handlers (e.g., `workspaceSymbolHandler`) use this pattern — match it.
+
+*Encoding / resource / temporal: skipped — mechanical union dispatch; concurrency inherited from existing handler infrastructure (no novel synchronization introduced).*
+
+#### Handler concurrency (inherited pattern)
+
+**Temporal Betrayal — didChange between getHandle and AST walk**
+- Assumption: `handle.tree` is stable for the handler's duration.
+- Betrayal: Non-blocking messages (per `isBlockingMessage` policy) run in a thread pool; a concurrent didChange could swap the document's tree mid-walk.
+- Consequence: Reading stale tree → stale Item; if tree memory was freed → use-after-free.
+- Mitigation: **This task does NOT introduce novel synchronization — it mirrors the existing pattern used by `prepareRenameHandler`, `selectionRangeHandler`, `workspaceSymbolHandler`, etc.** If this race is a latent bug in the shared infrastructure, it affects every non-blocking handler identically and is out of scope for Task 1. If Task 1 needed concurrency safety beyond existing handlers, that would be a signal to escalate — but prepareCallHierarchy is architecturally identical to prepareRename.
+
 ## Out of Scope
 
 - `callHierarchy/incomingCalls` handler (Phase 2 Task 2)
@@ -245,3 +369,4 @@ Single-file fixtures only for this task. Cross-file infrastructure (import relat
 ## Log
 
 - [2026-04-14T19:33:21Z] [Seth] SRE fresh-session review (2026-04-14, all 10 categories applied). Findings: ONE factual error in Step 2 — incorrect tests.zig insertion line (cited line 22 between references/selection_range; correct position is line 13 before code_actions because 'call_hierarchy' < 'code_actions' alphabetically). Fixed in skeleton. All other claims spot-checked pass: Server.zig handler line numbers (1467/1574/1584/1588/1630/1794/1803-1827), HandledRequestParams union, isBlockingMessage non-blocking list (1636-1657), sendRequestSync dispatch, CallBuilder @ references.zig:556, innermostScopeAtIndexWithTag @ analysis.zig:6221, offsets.{nodeToRange,tokenToRange,positionToIndex}, AST tag references, tree.fullCall convention (4 tags), Server.Error pub @ line 98, selection_range.zig test pattern. Requirement/criteria bijection verified. No placeholders. Ready for adversarial-planning.
+- [2026-04-14T19:38:37Z] [Seth] Adversarial planning (2026-04-14): failure catalog added to Key Considerations. 7 components walked through 6 categories (state corruption/temporal/encoding skipped per-component where pure AST reads). Notable findings: (1) fullFnProto unwrap must be gated on tag switch — never call outside verified tag arm. (2) Anonymous fn exprs (const f = fn() void {};) have null name_token — decision: skip at Task 1, return null, added as success criterion. (3) comptime walk must short-circuit on first call (not full scan). (4) JSON round-trip test must exercise lsp_kit's LSPAny path, not raw std.json — strengthened success criterion. (5) Task 2/3 forward dependency: node_index staleness on didChange is their responsibility, not Task 1's. (6) 4-site Server.zig registration is exhaustive and ordered; step 4's null-returning handler test catches the full wiring chain. Ready for TDD execution.
