@@ -106,8 +106,44 @@ fn buildItemIfCallable(
                 .data = try encodeItemData(arena, uri, node),
             };
         },
+        .@"comptime" => {
+            // Only treat this comptime block as a callable if it actually contains a call.
+            // An idle comptime block (const/let/math-only) is not meaningful to surface in
+            // a call hierarchy.
+            if (!try comptimeBlockContainsCall(arena, tree, node)) return null;
+            const keyword_token = tree.nodeMainToken(node);
+            return .{
+                .name = "comptime",
+                .kind = .Function,
+                .uri = uri.raw,
+                .range = offsets.nodeToRange(tree, node, encoding),
+                .selectionRange = offsets.tokenToRange(tree, keyword_token, encoding),
+                .data = try encodeItemData(arena, uri, node),
+            };
+        },
         else => return null,
     }
+}
+
+/// Walks the descendants of `comptime_node` looking for a single call-like expression.
+/// Short-circuits on the first hit — we only need existence, not a count, per the
+/// adversarial catalog (avoid O(block_size) full scans).
+fn comptimeBlockContainsCall(
+    arena: std.mem.Allocator,
+    tree: *const Ast,
+    comptime_node: Ast.Node.Index,
+) !bool {
+    var walker: ast.Walker = try .init(arena, tree, comptime_node);
+    defer walker.deinit(arena);
+    while (try walker.next(arena, tree)) |event| switch (event) {
+        .open => |descendant| {
+            if (descendant == comptime_node) continue;
+            var buf: [1]Ast.Node.Index = undefined;
+            if (tree.fullCall(&buf, descendant) != null) return true;
+        },
+        .close => {},
+    };
+    return false;
 }
 
 /// Encode {uri, node} into the LSPAny payload that survives across prepare → incoming/outgoing.

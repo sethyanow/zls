@@ -73,6 +73,35 @@ test "prepare on test_decl with identifier name returns Item" {
     });
 }
 
+test "prepare on comptime block containing call returns Item" {
+    try testPrepare(
+        \\fn foo() void {}
+        \\comptime {
+        \\    <>foo();
+        \\}
+    , &.{
+        .{
+            .name = "comptime",
+            .kind = .Function,
+            .range_text =
+            \\comptime {
+            \\    foo();
+            \\}
+            ,
+            .selection_text = "comptime",
+        },
+    });
+}
+
+test "prepare on comptime block with no calls returns null" {
+    try testPrepare(
+        \\comptime {
+        \\    const <>x = 1;
+        \\    _ = x;
+        \\}
+    , &.{});
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
