@@ -1,11 +1,13 @@
 ---
 id: zls-t17
 title: 'Phase 2 Task 1: prepareCallHierarchy + Server Wiring'
-status: active
+status: closed
 type: task
 priority: 1
 parent: zls-gyi
 ---
+
+
 
 
 
@@ -371,3 +373,4 @@ Produced before implementation — findings grouped by component so the executin
 
 - [2026-04-14T19:33:21Z] [Seth] SRE fresh-session review (2026-04-14, all 10 categories applied). Findings: ONE factual error in Step 2 — incorrect tests.zig insertion line (cited line 22 between references/selection_range; correct position is line 13 before code_actions because 'call_hierarchy' < 'code_actions' alphabetically). Fixed in skeleton. All other claims spot-checked pass: Server.zig handler line numbers (1467/1574/1584/1588/1630/1794/1803-1827), HandledRequestParams union, isBlockingMessage non-blocking list (1636-1657), sendRequestSync dispatch, CallBuilder @ references.zig:556, innermostScopeAtIndexWithTag @ analysis.zig:6221, offsets.{nodeToRange,tokenToRange,positionToIndex}, AST tag references, tree.fullCall convention (4 tags), Server.Error pub @ line 98, selection_range.zig test pattern. Requirement/criteria bijection verified. No placeholders. Ready for adversarial-planning.
 - [2026-04-14T19:38:37Z] [Seth] Adversarial planning (2026-04-14): failure catalog added to Key Considerations. 7 components walked through 6 categories (state corruption/temporal/encoding skipped per-component where pure AST reads). Notable findings: (1) fullFnProto unwrap must be gated on tag switch — never call outside verified tag arm. (2) Anonymous fn exprs (const f = fn() void {};) have null name_token — decision: skip at Task 1, return null, added as success criterion. (3) comptime walk must short-circuit on first call (not full scan). (4) JSON round-trip test must exercise lsp_kit's LSPAny path, not raw std.json — strengthened success criterion. (5) Task 2/3 forward dependency: node_index staleness on didChange is their responsibility, not Task 1's. (6) 4-site Server.zig registration is exhaustive and ordered; step 4's null-returning handler test catches the full wiring chain. Ready for TDD execution.
+- [2026-04-14T20:03:54Z] [Seth] TDD debrief: All 17 tests pass (10 primary + 6 adversarial + round-trip). Full zig build test --summary all clean (598 pass, 11 skip, 0 fail). zig build check clean. zig fmt --check clean. Pushed 12 commits to origin/dev. Design decisions that emerged: parent-tag check (fn_proto inside fn_decl routes to outer fn_decl — caught by regression in existing fn_decl test during fn_proto cycle). Toolchain surprises: SymbolKind uses PascalCase (.Function not .function); Zig primitives i1/i2/... collide with identifier names; extern fn_proto's nodeToRange excludes trailing ;; tree.tokenSlice returns the full @"..." wrapper for quoted identifiers. Task 2/3 inherit: locked data shape {uri:string, node:integer} as json.Value.object; 4-site Server.zig wiring pattern; ast.Walker-from-root + innermost-to-outermost scan approach. No corrections from user. Memory updated (project_call_hierarchy_epic.md reflects closed Phase 1 + Task 1).
