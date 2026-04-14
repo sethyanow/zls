@@ -94,6 +94,18 @@ fn buildItemIfCallable(
                 .data = try encodeItemData(arena, uri, node),
             };
         },
+        .test_decl => {
+            const name_token = tree.nodeData(node).opt_token_and_node[0].unwrap() orelse return null;
+            const name = tree.tokenSlice(name_token);
+            return .{
+                .name = name,
+                .kind = .Function,
+                .uri = uri.raw,
+                .range = offsets.nodeToRange(tree, node, encoding),
+                .selectionRange = offsets.tokenToRange(tree, name_token, encoding),
+                .data = try encodeItemData(arena, uri, node),
+            };
+        },
         else => return null,
     }
 }

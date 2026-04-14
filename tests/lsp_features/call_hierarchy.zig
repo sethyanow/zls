@@ -46,6 +46,33 @@ test "prepare on fn_proto (extern) returns function Item" {
     });
 }
 
+test "prepare on test_decl with string name returns Item" {
+    try testPrepare(
+        \\test "<>my test" { _ = 1; }
+    , &.{
+        .{
+            .name = "\"my test\"",
+            .kind = .Function,
+            .range_text = "test \"my test\" { _ = 1; }",
+            .selection_text = "\"my test\"",
+        },
+    });
+}
+
+test "prepare on test_decl with identifier name returns Item" {
+    try testPrepare(
+        \\fn target() void {}
+        \\test <>target { _ = 1; }
+    , &.{
+        .{
+            .name = "target",
+            .kind = .Function,
+            .range_text = "test target { _ = 1; }",
+            .selection_text = "target",
+        },
+    });
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
