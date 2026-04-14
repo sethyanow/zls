@@ -294,6 +294,82 @@ test "CallHierarchyItem.data round-trips through lsp_kit serialization" {
     try std.testing.expect(node_value.integer >= 0);
 }
 
+// -----------------------------------------------------------------------------
+// incomingCalls — RED test for single caller (zls-239)
+// -----------------------------------------------------------------------------
+
+const ExpectedCaller = struct {
+    /// Exact name field on the IncomingCall.from Item.
+    name: []const u8,
+    /// Each entry is the exact source slice the fromRange should cover.
+    from_ranges: []const []const u8,
+};
+
+test "incoming: single caller, one call site" {
+    try testIncomingCalls(
+        \\fn <>target() void {}
+        \\fn caller() void { target(); }
+    , &.{
+        .{
+            .name = "caller",
+            .from_ranges = &.{"target()"},
+        },
+    });
+}
+
+fn testIncomingCalls(source: []const u8, expected: []const ExpectedCaller) !void {
+    var phr = try helper.collectClearPlaceholders(allocator, source);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    // Phase 1: prepare to obtain the target Item (with Item.data encoded).
+    const prepare_params: types.call_hierarchy.PrepareParams = .{
+        .textDocument = .{ .uri = test_uri.raw },
+        .position = position,
+    };
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        prepare_params,
+    );
+    const items = prepared orelse {
+        std.debug.print("prepareCallHierarchy returned null — test setup is wrong\n", .{});
+        return error.PrepareFailed;
+    };
+    if (items.len == 0) return error.PrepareReturnedEmpty;
+    const target_item = items[0];
+
+    // Phase 2: incomingCalls on the prepared Item.
+    const incoming_params: types.call_hierarchy.IncomingCallsParams = .{
+        .item = target_item,
+    };
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/incomingCalls",
+        incoming_params,
+    );
+
+    const calls: []const types.call_hierarchy.IncomingCall = response orelse {
+        std.debug.print("incomingCalls returned null but expected {d} caller(s)\n", .{expected.len});
+        return error.InvalidResponse;
+    };
+
+    try std.testing.expectEqual(expected.len, calls.len);
+    for (expected, calls) |exp, got| {
+        try std.testing.expectEqualStrings(exp.name, got.from.name);
+        try std.testing.expectEqual(@as(usize, exp.from_ranges.len), got.fromRanges.len);
+        for (exp.from_ranges, got.fromRanges) |exp_range, got_range| {
+            const got_slice = offsets.rangeToSlice(phr.new_source, got_range, ctx.server.offset_encoding);
+            try std.testing.expectEqualStrings(exp_range, got_slice);
+        }
+    }
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
