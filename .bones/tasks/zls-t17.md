@@ -1,11 +1,12 @@
 ---
 id: zls-t17
 title: 'Phase 2 Task 1: prepareCallHierarchy + Server Wiring'
-status: open
+status: active
 type: task
 priority: 1
 parent: zls-gyi
 ---
+
 
 
 
@@ -178,20 +179,20 @@ Expected: Item with `name = "comptime"`, `kind = .function`, `selectionRange` = 
 
 ## Success Criteria
 
-- [ ] `tests/lsp_features/call_hierarchy.zig` exists and is registered in `tests/tests.zig`
-- [ ] Test: prepareCallHierarchy on `fn_decl` returns one Item with correct name/kind/range/selectionRange
-- [ ] Test: prepareCallHierarchy on `fn_proto` (extern) returns one Item
-- [ ] Test: prepareCallHierarchy on `test_decl` returns one Item (both string-named and identifier-named)
-- [ ] Test: prepareCallHierarchy on `.@"comptime"` block containing a call returns one Item
-- [ ] Test: prepareCallHierarchy on `.@"comptime"` block with no calls returns null
-- [ ] Test: prepareCallHierarchy on non-callable position (whitespace, variable decl) returns null
-- [ ] Test: prepareCallHierarchy on anonymous fn expression (`const f = fn() void {};` at position inside the fn literal) returns null (decision from adversarial catalog: skip, document as future work)
-- [ ] Test: CallHierarchyItem.data round-trips `{uri, node}` through lsp_kit's LSPAny serialization path (NOT raw std.json) — mandatory test, must pass before moving past Step 10
-- [ ] `src/features/call_hierarchy.zig` exports `prepareHandler` matching the expected Error!?[]const Item signature
-- [ ] `src/Server.zig` registers `@"textDocument/prepareCallHierarchy"` in `HandledRequestParams`, `isBlockingMessage`, `sendRequestSync`, plus a thin wrapper `prepareCallHierarchyHandler`
-- [ ] `zig build test --summary all` passes
-- [ ] `zig build check` compiles clean
-- [ ] `zig fmt --check .` passes
+- [x] `tests/lsp_features/call_hierarchy.zig` exists and is registered in `tests/tests.zig`
+- [x] Test: prepareCallHierarchy on `fn_decl` returns one Item with correct name/kind/range/selectionRange
+- [x] Test: prepareCallHierarchy on `fn_proto` (extern) returns one Item
+- [x] Test: prepareCallHierarchy on `test_decl` returns one Item (both string-named and identifier-named)
+- [x] Test: prepareCallHierarchy on `.@"comptime"` block containing a call returns one Item
+- [x] Test: prepareCallHierarchy on `.@"comptime"` block with no calls returns null
+- [x] Test: prepareCallHierarchy on non-callable position (whitespace, variable decl) returns null
+- [x] Test: prepareCallHierarchy on anonymous fn expression (`const f = fn() void {};` at position inside the fn literal) returns null (decision from adversarial catalog: skip, document as future work)
+- [x] Test: CallHierarchyItem.data round-trips `{uri, node}` through lsp_kit's LSPAny serialization path (NOT raw std.json) — mandatory test, must pass before moving past Step 10
+- [x] `src/features/call_hierarchy.zig` exports `prepareHandler` matching the expected Error!?[]const Item signature
+- [x] `src/Server.zig` registers `@"textDocument/prepareCallHierarchy"` in `HandledRequestParams`, `isBlockingMessage`, `sendRequestSync`, plus a thin wrapper `prepareCallHierarchyHandler`
+- [x] `zig build test --summary all` passes
+- [x] `zig build check` compiles clean
+- [x] `zig fmt --check .` passes
 
 ## Anti-Patterns (FORBIDDEN for this task)
 
