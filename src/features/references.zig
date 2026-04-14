@@ -5,6 +5,7 @@ const Ast = std.zig.Ast;
 
 const Server = @import("../Server.zig");
 const DocumentStore = @import("../DocumentStore.zig");
+const DocumentScope = @import("../DocumentScope.zig");
 const Analyser = @import("../analysis.zig");
 const lsp = @import("lsp");
 const types = lsp.types;
@@ -553,16 +554,37 @@ fn controlFlowReferences(
     return locations;
 }
 
+/// A single resolved call site, enriched with the enclosing caller function when one
+/// exists. `caller_fn_node` is `null` for calls that occur at file scope (inside a
+/// top-level `comptime` block with no enclosing fn). Consumers that only need the
+/// call location (e.g. `callsiteReferences` for type inference) ignore `caller_fn_node`.
+pub const CallSite = struct {
+    handle: *DocumentStore.Handle,
+    call_node: Ast.Node.Index,
+    caller_fn_node: ?Ast.Node.Index,
+};
+
 const CallBuilder = struct {
-    callsites: std.ArrayList(Analyser.NodeWithHandle) = .empty,
+    callsites: std.ArrayList(CallSite) = .empty,
     /// this is the declaration we are searching for
     target_decl: Analyser.DeclWithHandle,
     analyser: *Analyser,
 
     fn add(self: *CallBuilder, handle: *DocumentStore.Handle, call_node: Ast.Node.Index) error{OutOfMemory}!void {
+        const doc_scope = try handle.getDocumentScope();
+        const call_loc = offsets.nodeToLoc(&handle.tree, call_node);
+        const caller_fn_node: ?Ast.Node.Index = blk: {
+            const scope_index = Analyser.innermostScopeAtIndexWithTag(
+                doc_scope,
+                call_loc.start,
+                std.EnumSet(DocumentScope.Scope.Tag).initOne(.function),
+            ).unwrap() orelse break :blk null;
+            break :blk doc_scope.getScopeAstNode(scope_index).?;
+        };
         try self.callsites.append(self.analyser.arena, .{
             .handle = handle,
-            .node = call_node,
+            .call_node = call_node,
+            .caller_fn_node = caller_fn_node,
         });
     }
 
@@ -629,12 +651,16 @@ const CallBuilder = struct {
     }
 };
 
-pub fn callsiteReferences(
+/// Gather every call site of `decl_handle` across the workspace (or just the
+/// declaring file when `workspace == false`), enriched with the enclosing caller
+/// function node. This is the Approach C unified codepath used by both the
+/// call hierarchy feature and the backward-compatible `callsiteReferences` wrapper.
+pub fn callsiteReferencesWithCaller(
     analyser: *Analyser,
     decl_handle: Analyser.DeclWithHandle,
     /// search other files for references
     workspace: bool,
-) Analyser.Error!std.ArrayList(Analyser.NodeWithHandle) {
+) Analyser.Error!std.ArrayList(CallSite) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
@@ -662,6 +688,25 @@ pub fn callsiteReferences(
     }
 
     return builder.callsites;
+}
+
+/// Backward-compatible wrapper: returns the old `NodeWithHandle` shape that existing
+/// consumers (e.g. `src/analysis.zig:1775` for callsite-based type inference) expect.
+/// MUST preserve every CallSite — including top-level calls where `caller_fn_node == null`
+/// — because the consumer does not care about caller context, only call node + handle.
+pub fn callsiteReferences(
+    analyser: *Analyser,
+    decl_handle: Analyser.DeclWithHandle,
+    /// search other files for references
+    workspace: bool,
+) Analyser.Error!std.ArrayList(Analyser.NodeWithHandle) {
+    const sites = try callsiteReferencesWithCaller(analyser, decl_handle, workspace);
+    var out: std.ArrayList(Analyser.NodeWithHandle) = .empty;
+    try out.ensureTotalCapacityPrecise(analyser.arena, sites.items.len);
+    for (sites.items) |cs| {
+        out.appendAssumeCapacity(.{ .handle = cs.handle, .node = cs.call_node });
+    }
+    return out;
 }
 
 pub const GeneralReferencesRequest = union(enum) {
