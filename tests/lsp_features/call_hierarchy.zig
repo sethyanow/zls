@@ -102,6 +102,20 @@ test "prepare on comptime block with no calls returns null" {
     , &.{});
 }
 
+test "prepare on whitespace between functions returns null" {
+    try testPrepare(
+        \\fn a() void {}
+        \\<>
+        \\fn b() void {}
+    , &.{});
+}
+
+test "prepare on top-level variable declaration returns null" {
+    try testPrepare(
+        \\const <>x = 1;
+    , &.{});
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
