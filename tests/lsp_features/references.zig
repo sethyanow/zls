@@ -1175,3 +1175,55 @@ test "unresolved build file falls through to fallback path" {
     }
     try std.testing.expect(found_a);
 }
+
+test "callsiteReferences thin wrapper preserves top-level callsites (zls-239)" {
+    // Regression guard: the thin wrapper from zls-239 projects
+    // CallSite -> NodeWithHandle for backward compatibility with
+    // src/analysis.zig:1775's callsite-based type inference.
+    // It MUST preserve every call site, including ones whose enclosing
+    // scope is not a function (e.g. calls inside a top-level comptime block).
+    // If the wrapper filtered those out, type-inference coverage would
+    // silently regress across the workspace.
+    const source =
+        \\fn target() void {}
+        \\fn fn_caller() void {
+        \\    target();
+        \\}
+        \\comptime {
+        \\    target();
+        \\}
+    ;
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = source });
+    const handle = ctx.server.document_store.getHandle(uri).?;
+    const tree = handle.tree;
+
+    // Find the fn_decl for `target` — the first fn_decl in the tree.
+    var target_node: ?std.zig.Ast.Node.Index = null;
+    for (0..tree.nodes.len) |i| {
+        const idx: std.zig.Ast.Node.Index = @enumFromInt(@as(u32, @intCast(i)));
+        if (tree.nodeTag(idx) == .fn_decl) {
+            target_node = idx;
+            break;
+        }
+    }
+    try std.testing.expect(target_node != null);
+
+    var analyser = ctx.server.initAnalyser(ctx.arena.allocator(), handle);
+    defer analyser.deinit();
+
+    const decl_handle: zls.Analyser.DeclWithHandle = .{
+        .decl = .{ .ast_node = target_node.? },
+        .handle = handle,
+    };
+
+    const refs = try zls.references.callsiteReferences(&analyser, decl_handle, false);
+
+    // Expected: 2 call sites — one from `fn_caller` and one from the top-level
+    // comptime block. If the wrapper filtered the comptime-block caller (whose
+    // CallSite.caller_fn_node is null), we'd see only 1.
+    try std.testing.expectEqual(@as(usize, 2), refs.items.len);
+}

@@ -32,11 +32,11 @@ The implementation extends the existing `references.zig` Builder (Approach C) to
 ## Success Criteria
 - [x] `prepareCallHierarchy` returns correct items for functions, methods, tests, and comptime blocks
 - [x] `prepareCallHierarchy` returns null for non-callable positions
-- [ ] `incomingCalls` returns callers across multiple files with correct grouping and ranges
-- [ ] `incomingCalls` groups multiple calls from the same caller into one IncomingCall with multiple fromRanges
+- [x] `incomingCalls` returns callers across multiple files with correct grouping and ranges
+- [x] `incomingCalls` groups multiple calls from the same caller into one IncomingCall with multiple fromRanges
 - [ ] `outgoingCalls` returns callees across multiple files with correct grouping and ranges
 - [ ] `outgoingCalls` groups multiple calls to the same callee into one OutgoingCall with multiple fromRanges
-- [ ] Builder extension does not break existing findReferences behavior
+- [x] Builder extension does not break existing findReferences behavior
 - [ ] Server advertises callHierarchyProvider capability
 - [x] `zig build test --summary all` passes (including new call_hierarchy tests)
 - [x] `zig build test -Dtest-filter="call_hierarchy"` passes specifically

@@ -295,6 +295,159 @@ test "CallHierarchyItem.data round-trips through lsp_kit serialization" {
 }
 
 // -----------------------------------------------------------------------------
+// incomingCalls — adversarial decoder battery (zls-239)
+// -----------------------------------------------------------------------------
+
+/// Sends `callHierarchy/incomingCalls` with an Item whose `data` field is `data`.
+/// Asserts the handler returns null (the decoder rejected the malformed payload).
+/// All other Item fields are synthesized against a throwaway loaded document so
+/// that lsp_kit JSON serialization succeeds and the handler reaches `decodeItemData`.
+fn expectIncomingCallsDataRejected(data: ?types.LSPAny) !void {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = "fn dummy() void {}" });
+    const zero_pos: types.Position = .{ .line = 0, .character = 0 };
+    const zero_range: types.Range = .{ .start = zero_pos, .end = zero_pos };
+
+    const item: types.call_hierarchy.Item = .{
+        .name = "dummy",
+        .kind = .Function,
+        .uri = uri.raw,
+        .range = zero_range,
+        .selectionRange = zero_range,
+        .data = data,
+    };
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/incomingCalls",
+        types.call_hierarchy.IncomingCallsParams{ .item = item },
+    );
+    try std.testing.expect(response == null);
+}
+
+test "incoming decoder: data = null" {
+    try expectIncomingCallsDataRejected(null);
+}
+
+test "incoming decoder: data is not a JSON object" {
+    // Integer in place of object — decoder's switch falls into `else => return null`.
+    try expectIncomingCallsDataRejected(.{ .integer = 42 });
+}
+
+test "incoming decoder: empty object (missing uri and node)" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: object missing node field" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: object missing uri field" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("node", .{ .integer = 0 });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: node value is a string, not integer" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .string = "0" });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: uri value is an integer, not string" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .integer = 42 });
+    try obj.put("node", .{ .integer = 0 });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: negative node integer" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .integer = -1 });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: node integer overflows u32" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .integer = 9_999_999_999 });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: uri does not map to a loaded handle" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "file:///this/path/does/not/exist.zig" });
+    try obj.put("node", .{ .integer = 0 });
+    try expectIncomingCallsDataRejected(.{ .object = obj });
+}
+
+test "incoming decoder: node points at non-callable tag (stale data)" {
+    // Set up a real document, then manually construct an Item whose data.node
+    // points at a var_decl (non-callable) instead of the fn_decl prepare would
+    // have encoded. The handler should recognise the stale tag and return null.
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = "const x = 42;\nfn foo() void {}" });
+    const handle = ctx.server.document_store.getHandle(uri).?;
+    const tree = handle.tree;
+
+    // Scan nodes for the var_decl. We know it's there — "const x = 42;".
+    var var_decl_node: std.zig.Ast.Node.Index = @enumFromInt(0);
+    var found = false;
+    for (0..tree.nodes.len) |i| {
+        const idx: std.zig.Ast.Node.Index = @enumFromInt(@as(u32, @intCast(i)));
+        switch (tree.nodeTag(idx)) {
+            .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
+                var_decl_node = idx;
+                found = true;
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
+
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = uri.raw });
+    try obj.put("node", .{ .integer = @intCast(@intFromEnum(var_decl_node)) });
+
+    const zero_pos: types.Position = .{ .line = 0, .character = 0 };
+    const zero_range: types.Range = .{ .start = zero_pos, .end = zero_pos };
+    const item: types.call_hierarchy.Item = .{
+        .name = "x",
+        .kind = .Function,
+        .uri = uri.raw,
+        .range = zero_range,
+        .selectionRange = zero_range,
+        .data = .{ .object = obj },
+    };
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/incomingCalls",
+        types.call_hierarchy.IncomingCallsParams{ .item = item },
+    );
+    try std.testing.expect(response == null);
+}
+
+// -----------------------------------------------------------------------------
 // incomingCalls — RED test for single caller (zls-239)
 // -----------------------------------------------------------------------------
 
@@ -315,6 +468,261 @@ test "incoming: single caller, one call site" {
             .from_ranges = &.{"target()"},
         },
     });
+}
+
+test "incoming: single caller, multiple call sites collapse into one IncomingCall" {
+    try testIncomingCalls(
+        \\fn <>t() void {}
+        \\fn c() void {
+        \\    t();
+        \\    t();
+        \\    t();
+        \\}
+    , &.{
+        .{
+            .name = "c",
+            .from_ranges = &.{ "t()", "t()", "t()" },
+        },
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Adversarial stress battery (zls-239, post-TDD)
+// -----------------------------------------------------------------------------
+
+test "incoming adversarial: target with zero callers returns empty slice" {
+    // Empty pattern: the function is defined but nothing calls it. Handler
+    // should return an empty (non-null) slice — applicable, no callers.
+    try testIncomingCalls(
+        \\fn <>orphan() void {}
+    , &.{});
+}
+
+test "incoming adversarial: disconnected callers across three files" {
+    // Disconnected pattern: target in file A, independent callers in files B and C.
+    // Both callers must appear with URIs that distinguish them from each other.
+    const source_a = "pub fn <>target() void {}";
+    const source_b =
+        \\const a = @import("Untitled-0.zig");
+        \\fn b_caller() void { a.target(); }
+    ;
+    const source_c =
+        \\const a = @import("Untitled-0.zig");
+        \\fn c_caller() void { a.target(); }
+    ;
+
+    var phr = try helper.collectClearPlaceholders(allocator, source_a);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri_a = try ctx.addDocument(.{ .source = phr.new_source });
+    const uri_b = try ctx.addDocument(.{ .source = source_b });
+    const uri_c = try ctx.addDocument(.{ .source = source_c });
+
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        types.call_hierarchy.PrepareParams{
+            .textDocument = .{ .uri = uri_a.raw },
+            .position = position,
+        },
+    );
+    const items = prepared orelse return error.PrepareFailed;
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/incomingCalls",
+        types.call_hierarchy.IncomingCallsParams{ .item = items[0] },
+    );
+    const calls = response orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+
+    // Each caller lives in its own file; assert both URIs appear exactly once.
+    var found_b = false;
+    var found_c = false;
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.from.uri, uri_b.raw)) {
+            try std.testing.expect(!found_b);
+            found_b = true;
+            try std.testing.expectEqualStrings("b_caller", call.from.name);
+        } else if (std.mem.eql(u8, call.from.uri, uri_c.raw)) {
+            try std.testing.expect(!found_c);
+            found_c = true;
+            try std.testing.expectEqualStrings("c_caller", call.from.name);
+        } else {
+            std.debug.print("unexpected caller uri: {s}\n", .{call.from.uri});
+            return error.UnexpectedCaller;
+        }
+    }
+    try std.testing.expect(found_b);
+    try std.testing.expect(found_c);
+}
+
+test "incoming adversarial: quoted-identifier caller name preserves wrapping" {
+    // Encoding boundary: the caller uses an @"..."-quoted identifier. The resulting
+    // IncomingCall.from.name should include the full token slice (including
+    // `@"..."`), matching Task 1's prepareCallHierarchy name-token behavior
+    // so round-tripping preserves the human identity.
+    try testIncomingCalls(
+        \\fn <>target() void {}
+        \\fn @"weird-name!"() void { target(); }
+    ,
+        &.{
+            .{
+                .name = "@\"weird-name!\"",
+                .from_ranges = &.{"target()"},
+            },
+        },
+    );
+}
+
+test "incoming adversarial: idempotent — two calls on same Item" {
+    // "Second run" pattern: if the handler mutates DocumentStore state or the
+    // CallBuilder accumulates in a wrong place, the second call would drift.
+    // Assert both calls return the same count and names.
+    var phr = try helper.collectClearPlaceholders(allocator,
+        \\fn <>target() void {}
+        \\fn caller() void { target(); target(); }
+    );
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        types.call_hierarchy.PrepareParams{
+            .textDocument = .{ .uri = uri.raw },
+            .position = position,
+        },
+    );
+    const items = prepared orelse return error.PrepareFailed;
+
+    const params = types.call_hierarchy.IncomingCallsParams{ .item = items[0] };
+
+    const first = try ctx.server.sendRequestSync(ctx.arena.allocator(), "callHierarchy/incomingCalls", params);
+    const second = try ctx.server.sendRequestSync(ctx.arena.allocator(), "callHierarchy/incomingCalls", params);
+
+    const a = first orelse return error.InvalidResponse;
+    const b = second orelse return error.InvalidResponse;
+
+    try std.testing.expectEqual(a.len, b.len);
+    try std.testing.expectEqual(@as(usize, 1), a.len);
+    try std.testing.expectEqualStrings(a[0].from.name, b[0].from.name);
+    try std.testing.expectEqualStrings(a[0].from.uri, b[0].from.uri);
+    try std.testing.expectEqual(a[0].fromRanges.len, b[0].fromRanges.len);
+    try std.testing.expectEqual(@as(usize, 2), a[0].fromRanges.len);
+}
+
+test "incoming adversarial: dense — six distinct callers each call target once" {
+    // Dense pattern: six fn_decls all calling target. All six should appear
+    // as separate IncomingCalls with single fromRanges (no cross-bucket leak).
+    try testIncomingCalls(
+        \\fn <>t() void {}
+        \\fn c1() void { t(); }
+        \\fn c2() void { t(); }
+        \\fn c3() void { t(); }
+        \\fn c4() void { t(); }
+        \\fn c5() void { t(); }
+        \\fn c6() void { t(); }
+    , &.{
+        .{ .name = "c1", .from_ranges = &.{"t()"} },
+        .{ .name = "c2", .from_ranges = &.{"t()"} },
+        .{ .name = "c3", .from_ranges = &.{"t()"} },
+        .{ .name = "c4", .from_ranges = &.{"t()"} },
+        .{ .name = "c5", .from_ranges = &.{"t()"} },
+        .{ .name = "c6", .from_ranges = &.{"t()"} },
+    });
+}
+
+test "incoming: test_decl returns empty slice (not null)" {
+    // test declarations can be invoked by the test runner but not by user code,
+    // so incomingCalls is applicable but produces no callers — empty, not null.
+    try testIncomingCalls(
+        \\test "<>named" { _ = 1; }
+    , &.{});
+}
+
+test "incoming: comptime block returns empty slice (not null)" {
+    // comptime blocks likewise have no user-code callers.
+    try testIncomingCalls(
+        \\fn foo() void {}
+        \\<>comptime {
+        \\    foo();
+        \\}
+    , &.{});
+}
+
+test "incoming: recursive self-call" {
+    try testIncomingCalls(
+        \\fn <>rec() void {
+        \\    rec();
+        \\}
+    , &.{
+        .{
+            .name = "rec",
+            .from_ranges = &.{"rec()"},
+        },
+    });
+}
+
+test "incoming: cross-file caller via @import" {
+    const source_a =
+        \\pub fn <>target() void {}
+    ;
+    const source_b =
+        \\const a = @import("Untitled-0.zig");
+        \\fn caller() void {
+        \\    a.target();
+        \\}
+    ;
+
+    var phr = try helper.collectClearPlaceholders(allocator, source_a);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri_a = try ctx.addDocument(.{ .source = phr.new_source });
+    const uri_b = try ctx.addDocument(.{ .source = source_b });
+
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    // Prepare at target in file A.
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        types.call_hierarchy.PrepareParams{
+            .textDocument = .{ .uri = uri_a.raw },
+            .position = position,
+        },
+    );
+    const items = prepared orelse return error.PrepareFailed;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+
+    // incomingCalls should find the caller in file B.
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/incomingCalls",
+        types.call_hierarchy.IncomingCallsParams{ .item = items[0] },
+    );
+    const calls = response orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+
+    try std.testing.expectEqualStrings("caller", calls[0].from.name);
+    try std.testing.expectEqualStrings(uri_b.raw, calls[0].from.uri);
+    try std.testing.expectEqual(@as(usize, 1), calls[0].fromRanges.len);
+
+    // The fromRange should cover the call expression `a.target()` in file B.
+    const got_slice = offsets.rangeToSlice(source_b, calls[0].fromRanges[0], ctx.server.offset_encoding);
+    try std.testing.expectEqualStrings("a.target()", got_slice);
 }
 
 fn testIncomingCalls(source: []const u8, expected: []const ExpectedCaller) !void {
