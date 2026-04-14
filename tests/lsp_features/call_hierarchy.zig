@@ -31,6 +31,21 @@ test "prepare on fn_decl returns function Item" {
     });
 }
 
+test "prepare on fn_proto (extern) returns function Item" {
+    // The extern prototype's node range does not include the trailing `;`
+    // (the semicolon is a separator token, not part of the fn_proto AST node).
+    try testPrepare(
+        \\extern fn <>extFn(a: i32) i32;
+    , &.{
+        .{
+            .name = "extFn",
+            .kind = .Function,
+            .range_text = "extern fn extFn(a: i32) i32",
+            .selection_text = "extFn",
+        },
+    });
+}
+
 fn testPrepare(source: []const u8, expected: []const ExpectedItem) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);

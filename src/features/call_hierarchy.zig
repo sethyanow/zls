@@ -48,7 +48,8 @@ pub fn prepareHandler(
     while (i > 0) {
         i -= 1;
         const node = stack.items[i];
-        if (try buildItemIfCallable(arena, handle.uri, tree, node, server.offset_encoding)) |item| {
+        const parent_tag: ?std.zig.Ast.Node.Tag = if (i > 0) tree.nodeTag(stack.items[i - 1]) else null;
+        if (try buildItemIfCallable(arena, handle.uri, tree, node, parent_tag, server.offset_encoding)) |item| {
             const out = try arena.alloc(types.call_hierarchy.Item, 1);
             out[0] = item;
             return out;
@@ -65,10 +66,21 @@ fn buildItemIfCallable(
     uri: Uri,
     tree: *const Ast,
     node: Ast.Node.Index,
+    parent_tag: ?std.zig.Ast.Node.Tag,
     encoding: offsets.Encoding,
 ) !?types.call_hierarchy.Item {
-    switch (tree.nodeTag(node)) {
-        .fn_decl => {
+    const tag = tree.nodeTag(node);
+    switch (tag) {
+        .fn_decl,
+        .fn_proto,
+        .fn_proto_one,
+        .fn_proto_multi,
+        .fn_proto_simple,
+        => {
+            // The fn_proto* variant that appears as the prototype child of a fn_decl is not
+            // callable on its own — the enclosing fn_decl is. Skip the child so the outer
+            // iteration matches the fn_decl on its next step.
+            if (tag != .fn_decl and parent_tag == .fn_decl) return null;
             var buf: [1]Ast.Node.Index = undefined;
             const fn_proto = tree.fullFnProto(&buf, node).?;
             const name_token = fn_proto.name_token orelse return null;
