@@ -368,6 +368,26 @@ fn gatherWorkspaceReferenceCandidates(
 
             try found_uris.ensureUnusedCapacity(arena, handle.file_imports.len);
             for (handle.file_imports) |import_uri| found_uris.putAssumeCapacity(import_uri, {});
+
+            // Union `resolved_imports` (module-name imports, std/builtin/root,
+            // build deps) alongside `file_imports`. Skip std — every file
+            // imports std, walking that edge would balloon the candidate set
+            // on reverse search for any user-code symbol. Snapshot under
+            // `impl.lock` so a concurrent `uriFromImportStr` insert (or
+            // `Handle.refresh` swap) can't free the URIs mid-walk.
+            const resolved_snapshot: []Uri = snap: {
+                handle.impl.lock.lockUncancelable(store.io);
+                defer handle.impl.lock.unlock(store.io);
+                const keys = handle.resolved_imports.keys();
+                const snap = try arena.alloc(Uri, keys.len);
+                for (keys, 0..) |k, idx| snap[idx] = try k.dupe(arena);
+                break :snap snap;
+            };
+            try found_uris.ensureUnusedCapacity(arena, resolved_snapshot.len);
+            for (resolved_snapshot) |resolved_uri| {
+                if (DocumentStore.isInStd(resolved_uri)) continue;
+                found_uris.putAssumeCapacity(resolved_uri, {});
+            }
         }
         return found_uris;
     }
@@ -384,6 +404,22 @@ fn gatherWorkspaceReferenceCandidates(
             // (which would deadlock inside the iteration).
             try store.ensureHandleLoaded(import_uri);
 
+            const gop = try per_file_dependants.getOrPutValue(arena, import_uri, .empty);
+            try gop.value_ptr.append(arena, handle.uri);
+        }
+
+        // Same union for resolved_imports (see build-system path comment).
+        const resolved_snapshot: []Uri = snap: {
+            handle.impl.lock.lockUncancelable(store.io);
+            defer handle.impl.lock.unlock(store.io);
+            const keys = handle.resolved_imports.keys();
+            const snap = try arena.alloc(Uri, keys.len);
+            for (keys, 0..) |k, idx| snap[idx] = try k.dupe(arena);
+            break :snap snap;
+        };
+        for (resolved_snapshot) |import_uri| {
+            if (DocumentStore.isInStd(import_uri)) continue;
+            try store.ensureHandleLoaded(import_uri);
             const gop = try per_file_dependants.getOrPutValue(arena, import_uri, .empty);
             try gop.value_ptr.append(arena, handle.uri);
         }

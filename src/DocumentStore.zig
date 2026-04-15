@@ -165,6 +165,12 @@ pub const Handle = struct {
     tree: Ast,
     /// List of every file that has been `@Import`ed. Does not include imported modules.
     file_imports: []const Uri,
+    /// Set of URIs that have been resolved through `uriFromImportStr` — covers
+    /// module-name imports (`@import("mod_b")`), `std`, `builtin`, `root`, and
+    /// build dependencies. Populated lazily as analysis exercises resolution.
+    /// Guarded by `impl.lock`. Cleared in `Handle.refresh` on re-parse.
+    /// URIs are duped with `store.allocator` and freed in `Handle.deinit`.
+    resolved_imports: Uri.ArrayHashMap(void) = .empty,
     /// Contains one entry for every `@cImport` in the document
     cimports: std.MultiArrayList(CImportHandle),
     /// `true` if the document has been directly opened by the client i.e. with `textDocument/didOpen`
@@ -458,6 +464,15 @@ pub const Handle = struct {
         handle.document_scope = .unset;
         old_handle.trigram_store = handle.trigram_store;
         handle.trigram_store = .unset;
+
+        // `resolved_imports` is mutated concurrently by `uriFromImportStr`
+        // running on OTHER handles' analyser contexts that happen to pass
+        // `handle` as the resolving handle. Swap under `impl.lock` so a
+        // concurrent insert can't observe the map mid-move.
+        handle.impl.lock.lockUncancelable(handle.impl.store.io);
+        old_handle.resolved_imports = handle.resolved_imports;
+        handle.resolved_imports = .empty;
+        handle.impl.lock.unlock(handle.impl.store.io);
     }
 
     fn parseTree(allocator: std.mem.Allocator, new_text: [:0]const u8, mode: Ast.Mode) error{OutOfMemory}!Ast {
@@ -557,6 +572,23 @@ pub const Handle = struct {
         },
     };
 
+    /// Cache a resolved import URI on this handle's `resolved_imports` set.
+    /// Called by `uriFromImportStr` for every successful `.one`/`.many` resolution.
+    /// Dupes the URI with `store.allocator` (the set owns the dupe) and dedups
+    /// via `getOrPut` — if the URI is already present, the dupe is freed.
+    ///
+    /// Takes `impl.lock` briefly. Caller MUST NOT hold `impl.lock`.
+    fn cacheResolvedImport(handle: *Handle, store: *DocumentStore, uri: Uri) error{OutOfMemory}!void {
+        var duped = try uri.dupe(store.allocator);
+        errdefer duped.deinit(store.allocator);
+
+        handle.impl.lock.lockUncancelable(store.io);
+        defer handle.impl.lock.unlock(store.io);
+
+        const gop = try handle.resolved_imports.getOrPut(store.allocator, duped);
+        if (gop.found_existing) duped.deinit(store.allocator);
+    }
+
     /// Caller must free `Handle.uri` if needed.
     /// Keep in sync with `dead`.
     fn deinit(self: *Handle, allocator: std.mem.Allocator) void {
@@ -571,6 +603,9 @@ pub const Handle = struct {
         self.trigram_store.deinit(allocator);
         for (self.file_imports) |uri| uri.deinit(allocator);
         allocator.free(self.file_imports);
+
+        for (self.resolved_imports.keys()) |uri| uri.deinit(allocator);
+        self.resolved_imports.deinit(allocator);
 
         for (self.cimports.items(.source)) |source| allocator.free(source);
         self.cimports.deinit(allocator);
@@ -2019,10 +2054,17 @@ pub const UriFromImportStringResult = union(enum) {
     }
 };
 
-/// takes the string inside a @import() node (without the quotation marks)
-/// and returns it's uri
-/// caller owns the returned memory
-/// **Thread safe** takes a shared lock
+/// Takes the string inside a `@import()` node (without the quotation marks)
+/// and returns its URI. Caller owns the returned memory.
+///
+/// On any successful resolution (`.one` / `.many`), this function also caches
+/// the resolved URI(s) into `handle.resolved_imports` so module-name import
+/// edges become visible to the reverse reference search
+/// (`gatherWorkspaceReferenceCandidates`). The cache persists until the handle
+/// is re-parsed (`Handle.refresh`) or freed.
+///
+/// **Thread safe.** Internally takes `handle.impl.lock` briefly during caching.
+/// **Caller MUST NOT hold `handle.impl.lock`** — `std.Io.Mutex` is not re-entrant.
 pub fn uriFromImportStr(
     self: *DocumentStore,
     allocator: std.mem.Allocator,
@@ -2032,6 +2074,24 @@ pub fn uriFromImportStr(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
+    var result = try self.uriFromImportStrImpl(allocator, handle, import_str);
+    errdefer result.deinit(allocator);
+
+    switch (result) {
+        .none => {},
+        .one => |uri| try handle.cacheResolvedImport(self, uri),
+        .many => |uris| for (uris) |uri| try handle.cacheResolvedImport(self, uri),
+    }
+
+    return result;
+}
+
+fn uriFromImportStrImpl(
+    self: *DocumentStore,
+    allocator: std.mem.Allocator,
+    handle: *Handle,
+    import_str: []const u8,
+) error{ Canceled, OutOfMemory }!UriFromImportStringResult {
     if (std.mem.endsWith(u8, import_str, ".zig") or std.mem.endsWith(u8, import_str, ".zon")) {
         const parsed_uri = handle.uri.toStdUri();
         return .{ .one = try Uri.resolveImport(allocator, handle.uri, parsed_uri, import_str) };

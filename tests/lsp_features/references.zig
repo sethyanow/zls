@@ -2,6 +2,7 @@ const std = @import("std");
 const zls = @import("zls");
 
 const helper = @import("../helper.zig");
+const helper_build = @import("../helper_build.zig");
 const Context = @import("../context.zig").Context;
 const ErrorBuilder = @import("../ErrorBuilder.zig");
 
@@ -1226,4 +1227,372 @@ test "callsiteReferences thin wrapper preserves top-level callsites (zls-239)" {
     // comptime block. If the wrapper filtered the comptime-block caller (whose
     // CallSite.caller_fn_node is null), we'd see only 1.
     try std.testing.expectEqual(@as(usize, 2), refs.items.len);
+}
+
+test "findReferences across module-name import, fallback path (zls-mxw)" {
+    // Same feature, fallback path. Build-system is bypassed by leaving
+    // `root_handle.associated_build_file = .none`, which short-circuits the
+    // `no_build_file` block in `gatherWorkspaceReferenceCandidates`. The
+    // fallback iterates every handle and records `handle imports X` edges
+    // into `per_file_dependants` — my fix makes that loop also walk
+    // `handle.resolved_imports`, so module-name edges participate in the
+    // reverse walk that finds callers of a target.
+    //
+    // Cursor is in b.zig on `doubled` — the classic "who calls me?" query.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = b_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/b.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+
+    // Warm the cache while a_handle is still .resolved — uriFromImportStr
+    // needs the build-file path to resolve "mod_b".
+    _ = try ctx.server.document_store.uriFromImportStr(
+        ctx.arena.allocator(),
+        a_handle,
+        "mod_b",
+    );
+
+    // Force fallback path by marking ONLY the root handle (b_handle) as
+    // .none. `gatherWorkspaceReferenceCandidates` gates on `root_handle`'s
+    // state — .none short-circuits the no_build_file block. Keeping a_handle
+    // at .resolved preserves mod_b → b.zig resolution during the actual
+    // reference walk (collectReferences on a.zig reads a_handle's build
+    // file to match `mod_b.doubled` against the target symbol).
+    //
+    // Overwriting .resolved with .none leaks the prior state's
+    // root_source_file; leaving a_handle alone avoids the leak. b_handle
+    // starts as .init (never stamped), so forcing .none is a clean write.
+    const b_handle_for_force = ctx.server.document_store.getHandle(b_uri) orelse return error.BHandleMissing;
+    b_handle_for_force.impl.associated_build_file = .none;
+
+    const b_source = @embedFile("../fixtures/module_imports/b.zig");
+    const doubled_pos = offsets.indexToPosition(
+        b_source,
+        std.mem.indexOf(u8, b_source, "doubled").?,
+        ctx.server.offset_encoding,
+    );
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = b_uri.raw },
+            .position = doubled_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("Server returned `null` for findReferences\n", .{});
+        return error.InvalidResponse;
+    };
+
+    var found_a = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, a_uri.raw)) {
+            found_a = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_a);
+}
+
+test "resolved_imports cleared on handle re-parse (zls-mxw R-M4)" {
+    // R-M4: when a handle's tree is replaced (re-parse via didChange),
+    // its resolved_imports set must be cleared. Without the clear, stale
+    // URIs (e.g., an import string that was renamed) would live forever
+    // and pollute reverse reference search. Directly inspects the field
+    // before and after re-parse.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+
+    _ = try ctx.server.document_store.uriFromImportStr(
+        ctx.arena.allocator(),
+        a_handle,
+        "mod_b",
+    );
+
+    try std.testing.expect(a_handle.resolved_imports.count() > 0);
+
+    // Trigger a re-parse via didChange. Handle pointer stays the same
+    // (store uses stable pointers); tree and dependent state rebuild.
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didChange", .{
+        .textDocument = .{ .uri = a_uri.raw, .version = 2 },
+        .contentChanges = &.{
+            .{ .text_document_content_change_whole_document = .{ .text =
+                \\const mod_b = @import("mod_b");
+                \\
+                \\pub fn entry(x: u32) u32 {
+                \\    return mod_b.doubled(x) + 0;
+                \\}
+                \\
+            } },
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), a_handle.resolved_imports.count());
+}
+
+test "findReferences across module-name import, build-system path (zls-mxw)" {
+    // Phase 2 R2/R3 gap exposed by zls-pun demo:
+    // `handle.file_imports` excludes module-name imports because `collectImports`
+    // filters on `.zig` suffix (DocumentStore.zig:519). Both paths of
+    // `gatherWorkspaceReferenceCandidates` iterate only `file_imports`, so a
+    // caller importing `@import("mod_b")` is invisible to reverse reference
+    // search.
+    //
+    // Fix: `resolved_imports` cache populated by `uriFromImportStr` and
+    // unioned into the candidate walk.
+    //
+    // This test exercises the build-system path. The cursor is in a.zig on
+    // `doubled` in the `mod_b.doubled(x)` call. LSP resolves to b.zig::doubled,
+    // so `root_handle = a_handle` and `target_handle = b_handle`. Without the
+    // fix, the walk starting at a.zig's module root (a_path) plus the target-
+    // module-root addition (b_path) still wouldn't union a_handle's
+    // resolved-import edges — if a.zig had other module imports beyond mod_b,
+    // they'd be silently missed. The fix makes every module-import edge
+    // visible to the walk.
+    //
+    // Fixture: a.zig does `@import("mod_b")`, calls `mod_b.doubled`. b.zig
+    // defines `doubled`. findReferences from a.zig's call site must find
+    // the call in a.zig (+ declaration in b.zig when includeDeclaration).
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open both files. No eager-load edge between them: a.zig's only import is
+    // "mod_b" (not .zig-suffixed), so `collectImports` skips it. Must didOpen
+    // b.zig explicitly.
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = b_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/b.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+    const b_handle = ctx.server.document_store.getHandle(b_uri) orelse return error.BHandleMissing;
+
+    // Build a fake resolved BuildConfig matching the fixture. mod_a imports mod_b.
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+    try helper_build.stampResolved(&ctx.server.document_store, b_handle, fb.build_file, b_path);
+
+    // Warm the resolved_imports cache. In real ZLS usage this happens
+    // organically via hover / goto / analysis before the user asks
+    // findReferences. Done explicitly here for deterministic cache state.
+    const resolve_result = try ctx.server.document_store.uriFromImportStr(
+        ctx.arena.allocator(),
+        a_handle,
+        "mod_b",
+    );
+    switch (resolve_result) {
+        .one => {},
+        else => return error.ModBDidNotResolve,
+    }
+
+    // Cursor on `doubled` in a.zig's `mod_b.doubled(x)` call.
+    const a_source = @embedFile("../fixtures/module_imports/a.zig");
+    const doubled_pos = offsets.indexToPosition(
+        a_source,
+        std.mem.indexOf(u8, a_source, "doubled").?,
+        ctx.server.offset_encoding,
+    );
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = a_uri.raw },
+            .position = doubled_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("Server returned `null` for findReferences\n", .{});
+        return error.InvalidResponse;
+    };
+
+    var found_a = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, a_uri.raw)) {
+            found_a = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_a);
 }
