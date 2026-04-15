@@ -4,14 +4,20 @@ title: 'Phase 2 Acceptance: Call Hierarchy Live Demo'
 status: open
 type: task
 priority: 1
+depends_on: [zls-mxw, zls-029]
 parent: zls-gyi
 ---
 
+
+
 ## Context
 
-Phase 2 of zls-xjj (Call Hierarchy Implementation) is technically complete. Implementation tasks zls-t17 (prepareCallHierarchy + all callable kinds), zls-239 (incomingCalls + caller grouping), and zls-a9k (outgoingCalls + capability flip) are closed. All 10 code-level sub-epic criteria are checked; `zig build test` passes, `zig fmt --check .` passes.
+Phase 2 of zls-xjj (Call Hierarchy Implementation) has three implementation tasks closed (zls-t17, zls-239, zls-a9k) — the call hierarchy protocol is wired, handlers are implemented, capability is advertised. A first acceptance demo run surfaced a real R2/R3 gap: cross-file coverage only works for file-path imports, not module-name imports — i.e., Phase 2's "spanning all files reachable via the import graph" requirement is only half-satisfied by Phase 1's substrate. Two blockers were filed:
 
-This task is the user-facing acceptance step: agent documentation + narrated LSP tool walkthrough against real ZLS symbols.
+- **zls-mxw** — module-import coverage in reverse reference search (Shape B: lazy `resolved_imports` cache on Handle populated via `uriFromImportStr`).
+- **zls-029** — findReferences on `@import` string literals as a distinct first-class feature.
+
+This task is the user-facing acceptance step once both blockers land: agent documentation + narrated LSP tool walkthrough against real ZLS symbols AND against a foreign multi-module Zig codebase (forge_graph_zig) that exercises the module-import path.
 
 ## Agent Documentation (complete before presenting demo)
 
@@ -21,7 +27,7 @@ This task is the user-facing acceptance step: agent documentation + narrated LSP
 
 ## What This Phase Built
 
-ZLS now implements the LSP call hierarchy protocol — three methods (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`) backed by the extended `references.zig` Builder. Callers and callees are grouped by enclosing function with `fromRanges` for each call site, and results span the full import graph (from Phase 1's eager transitive loading). Server advertises `callHierarchyProvider`.
+ZLS now implements the LSP call hierarchy protocol — three methods (`textDocument/prepareCallHierarchy`, `callHierarchy/incomingCalls`, `callHierarchy/outgoingCalls`) backed by the extended `references.zig` Builder. Callers and callees are grouped by enclosing function with `fromRanges` for each call site. After zls-mxw and zls-029 land, the import-graph coverage is complete: both file-path imports (`@import("foo.zig")`, covered by Phase 1) and module-name imports (`@import("foo")`, covered by zls-mxw's lazy `resolved_imports` cache on Handle) are walked by candidate discovery, and `@import` string literals are themselves first-class findReferences targets (zls-029). Server advertises `callHierarchyProvider`.
 
 ## Environment Setup
 
@@ -68,6 +74,17 @@ Live narrated LSP tool walkthrough. The agent runs each step, names the symbol a
 - Target: a variable name or a string literal
 - Expected: `prepareCallHierarchy` returns null (or an empty result), confirming the handler rejects non-callable positions.
 
+**Demo 8 — Foreign-codebase module imports (blocked by zls-mxw)**
+- Target: `findBridges` at `/Volumes/code/forge_worktrees/optimize/zig/forge_graph_zig/src/algorithms.zig:164`
+- Before zls-mxw: `incomingCalls` returned empty because the caller `edge_metrics.zig:138` imports `algorithms` by module name, not by `.zig` path.
+- Expected after zls-mxw: `incomingCalls` returns the call site in `edge_metrics.zig:138`, plus all test-file call sites in `test/algorithms_tests.zig`.
+- Narration: shows that Phase 2's R2/R3 ("spanning all files reachable via the import graph") is actually met for real-world multi-module Zig projects, not just for self-hosted ZLS.
+
+**Demo 9 — findReferences on an `@import` string literal (blocked by zls-029)**
+- Target: `@import("algorithms")` in `edge_metrics.zig` (or similar string-literal position in the forge fixture)
+- Expected: the result set includes other `@import` string literals across the codebase that resolve to the same `algorithms.zig` URI — file-path and module-name callsites alike, compared by resolved URI.
+- Narration: shows that import relationships are now first-class queryable entities, distinct from symbol references.
+
 ## Sign-Off
 
 - [ ] Demo 1: prepareCallHierarchy on `initAnalyser` returns a correct CallHierarchyItem
@@ -77,5 +94,7 @@ Live narrated LSP tool walkthrough. The agent runs each step, names the symbol a
 - [ ] Demo 5: outgoingCalls cross-file confirmed
 - [ ] Demo 6: test declaration returns valid item
 - [ ] Demo 7: non-callable position returns null
+- [ ] Demo 8: incomingCalls on `algorithms.findBridges` in forge finds callers across module-imported files (zls-mxw landed)
+- [ ] Demo 9: findReferences on an `@import` string literal finds cross-file importers by resolved URI (zls-029 landed)
 - [ ] CLAUDE.md updated to mention call_hierarchy.zig
 - [ ] Phase 2 complete — zls-gyi can close, parent epic zls-xjj final demo criterion satisfied

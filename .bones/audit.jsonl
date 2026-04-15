@@ -49,3 +49,11 @@
 {"timestamp":"2026-04-15T08:26:54.952770+00:00","actor":"Seth","event_type":"created","task_id":"zls-pun","details":{}}
 {"timestamp":"2026-04-15T08:26:59.170984+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"parent-child","to":"zls-pun"}}
 {"timestamp":"2026-04-15T08:26:59.171486+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-pun"}}
+{"timestamp":"2026-04-15T10:27:24.981215+00:00","actor":"Seth","event_type":"created","task_id":"zls-mxw","details":{}}
+{"timestamp":"2026-04-15T10:27:25.130196+00:00","actor":"Seth","event_type":"created","task_id":"zls-029","details":{}}
+{"timestamp":"2026-04-15T10:27:31.863787+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"parent-child","to":"zls-mxw"}}
+{"timestamp":"2026-04-15T10:27:31.864488+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-mxw"}}
+{"timestamp":"2026-04-15T10:27:31.908749+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"parent-child","to":"zls-029"}}
+{"timestamp":"2026-04-15T10:27:31.909452+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-029"}}
+{"timestamp":"2026-04-15T10:27:31.960414+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-pun","details":{"kind":"blocks","to":"zls-mxw"}}
+{"timestamp":"2026-04-15T10:27:32.022300+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-pun","details":{"kind":"blocks","to":"zls-029"}}
