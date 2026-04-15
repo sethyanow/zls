@@ -1823,3 +1823,619 @@ test "gatherWorkspaceReferenceCandidates skips std when resolved_imports contain
         }
     }
 }
+
+test "findReferences on @import string literal includes cursor site with includeDeclaration (zls-029 R-I1)" {
+    // R-I1: findReferences on an `@import("X")` string literal returns source
+    // locations where `@import` resolves to the same URI. With includeDeclaration
+    // true, the cursor's own location is in the set.
+    //
+    // Minimum viable: cursor on a.zig's `@import("mod_b")`, resolved BuildConfig,
+    // expect at least the cursor's own location in the returned set.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = b_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/b.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+
+    // Warm the cache — mod_b → b.zig
+    _ = try ctx.server.document_store.uriFromImportStr(
+        ctx.arena.allocator(),
+        a_handle,
+        "mod_b",
+    );
+
+    // Cursor on the "mod_b" string literal inside a.zig's @import call.
+    // `@import("mod_b")` — land inside the quotes.
+    const a_source = @embedFile("../fixtures/module_imports/a.zig");
+    const import_str_byte = std.mem.indexOf(u8, a_source, "\"mod_b\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(a_source, import_str_byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = a_uri.raw },
+            .position = cursor_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("Server returned `null` for findReferences on @import string\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // Cursor's own location must be in the set (includeDeclaration = true).
+    var found_self = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, a_uri.raw)) {
+            found_self = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_self);
+}
+
+test "findReferences on @import string with unresolved build config returns empty cleanly (zls-029 R-I4)" {
+    // R-I4: when build config is unresolved (associated_build_file = .none),
+    // `uriFromImportStr("mod_b")` returns .none → handler returns empty result.
+    // Must not crash, must not return garbage. Empty and null are both valid
+    // LSP semantics for "no references".
+
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    // Deliberately skip stampResolved — handle stays at `.init` /.none for
+    // associated_build_file, so module-name resolution fails.
+
+    const a_source = @embedFile("../fixtures/module_imports/a.zig");
+    const import_str_byte = std.mem.indexOf(u8, a_source, "\"mod_b\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(a_source, import_str_byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = a_uri.raw },
+            .position = cursor_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    // Accept null OR empty slice. Both encode "no references" per LSP. Must
+    // not crash, must not include spurious locations.
+    if (response) |locations| {
+        try std.testing.expectEqual(@as(usize, 0), locations.len);
+    }
+}
+
+test "findReferences matches @import across different literal strings resolving to same URI (zls-029 R-I2)" {
+    // R-I2: URI-based comparison. a.zig imports mod_b (module name),
+    // c.zig imports "b.zig" (file path). Both resolve to b.zig.
+    // Cursor on a.zig's "mod_b" must find c.zig's "b.zig" as a reference,
+    // and vice versa.
+
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const c_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/c.zig" });
+    defer allocator.free(c_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+    const c_uri: zls.Uri = try .fromPath(allocator, c_path);
+    defer c_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    inline for (.{ "b.zig", "a.zig", "c.zig" }) |name| {
+        const uri = switch (name[0]) {
+            'a' => a_uri,
+            'b' => b_uri,
+            'c' => c_uri,
+            else => unreachable,
+        };
+        _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+            .textDocument = .{
+                .uri = uri.raw,
+                .languageId = .{ .custom_value = "zig" },
+                .version = 1,
+                .text = @embedFile("../fixtures/module_imports/" ++ name),
+            },
+        });
+    }
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+    const c_handle = ctx.server.document_store.getHandle(c_uri) orelse return error.CHandleMissing;
+
+    // BuildConfig has three modules: a, b, c — so all three are seeded as
+    // module roots in gatherWorkspaceReferenceCandidates.
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path, c_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+    try helper_build.stampResolved(&ctx.server.document_store, c_handle, fb.build_file, c_path);
+
+    // Warm resolution caches so mod_b and b.zig both map to b.zig.
+    _ = try ctx.server.document_store.uriFromImportStr(ctx.arena.allocator(), a_handle, "mod_b");
+    _ = try ctx.server.document_store.uriFromImportStr(ctx.arena.allocator(), c_handle, "b.zig");
+
+    // Direction 1: cursor on a.zig's `"mod_b"`, expect match in c.zig.
+    {
+        const a_source = @embedFile("../fixtures/module_imports/a.zig");
+        const import_str_byte = std.mem.indexOf(u8, a_source, "\"mod_b\"").? + 1;
+        const cursor_pos = offsets.indexToPosition(a_source, import_str_byte, ctx.server.offset_encoding);
+
+        const response = try ctx.server.sendRequestSync(
+            ctx.arena.allocator(),
+            "textDocument/references",
+            types.reference.Params{
+                .textDocument = .{ .uri = a_uri.raw },
+                .position = cursor_pos,
+                .context = .{ .includeDeclaration = false },
+            },
+        );
+
+        const locations: []const types.Location = response orelse {
+            std.debug.print("R-I2 direction 1: server returned null\n", .{});
+            return error.InvalidResponse;
+        };
+
+        var found_c = false;
+        for (locations) |loc| {
+            if (std.mem.eql(u8, loc.uri, c_uri.raw)) {
+                found_c = true;
+                break;
+            }
+        }
+        try std.testing.expect(found_c);
+    }
+
+    // Direction 2: cursor on c.zig's `"b.zig"`, expect match in a.zig.
+    {
+        const c_source = @embedFile("../fixtures/module_imports/c.zig");
+        const import_str_byte = std.mem.indexOf(u8, c_source, "\"b.zig\"").? + 1;
+        const cursor_pos = offsets.indexToPosition(c_source, import_str_byte, ctx.server.offset_encoding);
+
+        const response = try ctx.server.sendRequestSync(
+            ctx.arena.allocator(),
+            "textDocument/references",
+            types.reference.Params{
+                .textDocument = .{ .uri = c_uri.raw },
+                .position = cursor_pos,
+                .context = .{ .includeDeclaration = false },
+            },
+        );
+
+        const locations: []const types.Location = response orelse {
+            std.debug.print("R-I2 direction 2: server returned null\n", .{});
+            return error.InvalidResponse;
+        };
+
+        var found_a = false;
+        for (locations) |loc| {
+            if (std.mem.eql(u8, loc.uri, a_uri.raw)) {
+                found_a = true;
+                break;
+            }
+        }
+        try std.testing.expect(found_a);
+    }
+}
+
+test "findReferences on @import(\"std\") cross-references across files (zls-029 R-I3)" {
+    // R-I3: `std` is a resolvable import target (via config.zig_lib_dir).
+    // Two files both importing std must cross-reference via URI comparison —
+    // not just via literal text (R-I3 is a subcase of R-I2 for built-in names).
+    //
+    // Test context sets zig_lib_dir explicitly (see tests/context.zig:58), so
+    // resolution does not depend on host Zig installation state.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri_a = try ctx.addDocument(.{
+        .source =
+        \\const std = @import("std");
+        \\pub fn a(x: u32) u32 {
+        \\    return std.math.max(x, 1);
+        \\}
+        \\
+        ,
+    });
+    const uri_b = try ctx.addDocument(.{
+        .source =
+        \\const std = @import("std");
+        \\pub fn b(x: u32) u32 {
+        \\    return std.math.min(x, 1);
+        \\}
+        \\
+        ,
+    });
+
+    // Cursor inside `"std"` in the first document.
+    const source_a = ctx.server.document_store.getHandle(uri_a).?.tree.source;
+    const import_str_byte = std.mem.indexOf(u8, source_a, "\"std\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source_a, import_str_byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = uri_a.raw },
+            .position = cursor_pos,
+            .context = .{ .includeDeclaration = false },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("R-I3: server returned null\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // Expect at least the `@import("std")` site in the other document to appear.
+    var found_b = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, uri_b.raw)) {
+            found_b = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_b);
+}
+
+test "prepareRename on @import string literal returns null (zls-029 R-I5)" {
+    // R-I5: `@import` string literals are not symbol declarations — renaming
+    // would change import paths / module names, which is a distinct concern
+    // with cross-module implications. Out of scope for this task.
+    // prepareRename on such a position must return null.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{
+        .source =
+        \\const foo = @import("std");
+        \\
+        ,
+    });
+
+    const source = ctx.server.document_store.getHandle(uri).?.tree.source;
+    const import_str_byte = std.mem.indexOf(u8, source, "\"std\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source, import_str_byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareRename",
+        types.prepare_rename.Params{
+            .textDocument = .{ .uri = uri.raw },
+            .position = cursor_pos,
+        },
+    );
+
+    try std.testing.expect(response == null);
+}
+
+test "adversarial: findReferences on @import(\"\") returns empty (zls-029)" {
+    // Empty-string pattern: `@import("")` is syntactically valid but
+    // semantically hostile. `stringLiteralContentLoc` returns a zero-length
+    // loc; handler must return empty, never crash.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{
+        .source =
+        \\const empty = @import("");
+        \\
+        ,
+    });
+
+    const source = ctx.server.document_store.getHandle(uri).?.tree.source;
+    // Cursor between the two quotes of `""`.
+    const byte = std.mem.indexOf(u8, source, "\"\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source, byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = uri.raw },
+            .position = cursor_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    if (response) |locations| {
+        try std.testing.expectEqual(@as(usize, 0), locations.len);
+    }
+}
+
+test "adversarial: findReferences returns every @import site when same target is imported redundantly (zls-029)" {
+    // Redundant pattern: a single file may `@import` the same target multiple
+    // times. Each occurrence is its own Location. Cursor on one of them with
+    // includeDeclaration=true must return all N sites.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{
+        .source =
+        \\const s1 = @import("std");
+        \\const s2 = @import("std");
+        \\const s3 = @import("std");
+        \\
+        ,
+    });
+
+    const source = ctx.server.document_store.getHandle(uri).?.tree.source;
+    const first_byte = std.mem.indexOf(u8, source, "\"std\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source, first_byte, ctx.server.offset_encoding);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = uri.raw },
+            .position = cursor_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("adversarial redundant: server returned null\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // Count Locations that point at `uri` — must be 3.
+    var count_in_uri: usize = 0;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, uri.raw)) count_in_uri += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count_in_uri);
+}
+
+test "adversarial: findReferences on @import is deterministic across repeated calls (zls-029)" {
+    // Second-run pattern: calling the same query twice must yield the same
+    // result set (URI-wise). Catches caching / mutation hazards — e.g.
+    // resolved_imports populated by the first call affecting the second.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri_a = try ctx.addDocument(.{
+        .source =
+        \\const std = @import("std");
+        \\
+        ,
+    });
+    _ = try ctx.addDocument(.{
+        .source =
+        \\const std = @import("std");
+        \\
+        ,
+    });
+
+    const source_a = ctx.server.document_store.getHandle(uri_a).?.tree.source;
+    const first_byte = std.mem.indexOf(u8, source_a, "\"std\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source_a, first_byte, ctx.server.offset_encoding);
+
+    const params: types.reference.Params = .{
+        .textDocument = .{ .uri = uri_a.raw },
+        .position = cursor_pos,
+        .context = .{ .includeDeclaration = true },
+    };
+
+    const r1 = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/references", params);
+    const r2 = try ctx.server.sendRequestSync(ctx.arena.allocator(), "textDocument/references", params);
+
+    try std.testing.expect(r1 != null);
+    try std.testing.expect(r2 != null);
+    try std.testing.expectEqual(r1.?.len, r2.?.len);
+    // URI-sets identical. Order is an implementation detail; compare as multisets.
+    var seen: std.StringHashMap(usize) = .init(allocator);
+    defer seen.deinit();
+    for (r1.?) |loc| {
+        const gop = try seen.getOrPutValue(loc.uri, 0);
+        gop.value_ptr.* += 1;
+    }
+    for (r2.?) |loc| {
+        const entry = seen.getPtr(loc.uri) orelse return error.DeterministicMismatch;
+        if (entry.* == 0) return error.DeterministicMismatch;
+        entry.* -= 1;
+    }
+    var it = seen.iterator();
+    while (it.next()) |e| try std.testing.expectEqual(@as(usize, 0), e.value_ptr.*);
+}
+
+test "adversarial: findReferences on self-importing file (zls-029)" {
+    // Self-referential pattern: a file that imports itself. The target URI
+    // equals the cursor's URI; the only `@import` site IS the cursor site.
+    // With includeDeclaration=false, the set is empty (the one self-site is
+    // excluded). With includeDeclaration=true, the one self-site is included.
+    //
+    // Guards against accidental double-counting, infinite loops, or wrong
+    // self-exclusion semantics.
+
+    const io = std.testing.io;
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    // Use b.zig from the module_imports fixture — add an in-memory sibling
+    // `selfimp.zig` that imports `b.zig`, and cursor that. Wait: we want
+    // a file that imports ITSELF — use an untitled doc via addDocument.
+    //
+    // addDocument uses `untitled://...Untitled-N.zig` URIs. `@import("...")`
+    // with a file path resolves relative to the containing URI via
+    // `Uri.resolveImport`. For an untitled doc at `untitled:///Untitled-0.zig`,
+    // `@import("Untitled-0.zig")` must resolve back to the same URI.
+    //
+    // This is fragile (depends on untitled URI format), so use addDocument
+    // with a deterministic base and assert the resolution.
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // First addDocument yields Untitled-0.zig — import that back to self.
+    const uri = try ctx.addDocument(.{
+        .source =
+        \\const me = @import("Untitled-0.zig");
+        \\
+        ,
+    });
+
+    const source = ctx.server.document_store.getHandle(uri).?.tree.source;
+    const byte = std.mem.indexOf(u8, source, "\"Untitled-0.zig\"").? + 1;
+    const cursor_pos = offsets.indexToPosition(source, byte, ctx.server.offset_encoding);
+
+    // includeDeclaration=false → self-site excluded → empty.
+    {
+        const response = try ctx.server.sendRequestSync(
+            ctx.arena.allocator(),
+            "textDocument/references",
+            types.reference.Params{
+                .textDocument = .{ .uri = uri.raw },
+                .position = cursor_pos,
+                .context = .{ .includeDeclaration = false },
+            },
+        );
+        if (response) |locs| try std.testing.expectEqual(@as(usize, 0), locs.len);
+    }
+
+    // includeDeclaration=true → self-site included exactly once.
+    {
+        const response = try ctx.server.sendRequestSync(
+            ctx.arena.allocator(),
+            "textDocument/references",
+            types.reference.Params{
+                .textDocument = .{ .uri = uri.raw },
+                .position = cursor_pos,
+                .context = .{ .includeDeclaration = true },
+            },
+        );
+        const locs = response orelse return error.InvalidResponse;
+        try std.testing.expectEqual(@as(usize, 1), locs.len);
+        try std.testing.expect(std.mem.eql(u8, locs[0].uri, uri.raw));
+    }
+}

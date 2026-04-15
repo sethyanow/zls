@@ -1472,6 +1472,16 @@ fn prepareRenameHandler(server: *Server, arena: std.mem.Allocator, request: type
     };
     const handle = server.document_store.getHandle(document_uri) orelse return null;
     const source_index = offsets.positionToIndex(handle.tree.source, request.position, server.offset_encoding);
+
+    // zls-029 R-I5: `@import` string literals are not symbol declarations and
+    // must not offer a rename placeholder. `identifierLocFromIndex` already
+    // returns null for string-literal tokens, but make the contract explicit
+    // so the rejection is visible at this layer — not a by-product of a
+    // downstream helper. Renaming import paths / module names would require
+    // reverse-edge traversal in build.zig, which is out of scope.
+    const pos_context = try Analyser.getPositionContext(arena, &handle.tree, source_index, true);
+    if (pos_context == .import_string_literal) return null;
+
     const name_loc = offsets.identifierLocFromIndex(&handle.tree, source_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     return .{
