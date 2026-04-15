@@ -9,6 +9,7 @@ parent: zls-gyi
 
 
 
+
 ## Context
 
 Phase 2 acceptance demo (`zls-pun`) exposed a real R2/R3 gap: `incomingCalls` on a function defined in a module-imported file returns empty when the caller imports by module name (`@import("algorithms")`) rather than file path (`@import("algorithms.zig")`).
@@ -39,6 +40,8 @@ Rationale:
 - R-M3: Both paths of `gatherWorkspaceReferenceCandidates` (build-system and fallback) must include resolved-import edges alongside `file_imports` when walking handles.
 - R-M4: Invalidation — when a handle's tree is replaced (re-parse), its resolved-imports set must be cleared. Matches the lifecycle of `file_imports`.
 - R-M5: New test fixture and test exercising module-name imports end-to-end. Existing `tests/fixtures/eager_load/` covers file-path imports only.
+- R-M6 (scope extension 2026-04-15): `incomingCalls` / `findReferences` on a **definition** in a multi-module project with a resolved BuildConfig must find callers that import the target's module by name. Shape B alone (walk `resolved_imports` forward from `root_handle`'s single module root) is insufficient when `root == target` — reverse callers in other modules are structurally unreachable. Fix: seed the build-system path's forward walk from **all** module roots in `build_config.modules.map`, mirroring the existing `DocumentStore.BuildFile.isAssociatedWith` pattern at `src/DocumentStore.zig:95-152`.
+- R-M7: Dedicated std-pollution regression test. The `isInStd` guard in `gatherWorkspaceReferenceCandidates` (implemented in this task) has no explicit test. Add one: seed a handle's `resolved_imports` with the std URI, verify the candidate set does not recurse into std files.
 
 ## Implementation Steps
 
@@ -76,23 +79,47 @@ Rationale:
    - Cross-module call hierarchy: `incomingCalls` on a function in `b.zig` finds the call site in `a.zig`.
    - Std pollution regression: walking a handle whose `resolved_imports` contains the std URI does NOT cause `gatherWorkspaceReferenceCandidates` to recurse into std (candidate set size bounded).
 
-6. **Forge demo re-run** — after implementation, re-run `incomingCalls` on `algorithms.findBridges` at `forge_worktrees/optimize/zig/forge_graph_zig/src/algorithms.zig:164`. Expected: the call site in `edge_metrics.zig:138` appears.
+6. **Definition-query seed fix (R-M6)** — in `src/features/references.zig` `gatherWorkspaceReferenceCandidates` build-system path (current L336-393):
 
-7. **Verify all tests pass** — `zig build test --summary all`, `zig build check`, `zig fmt --check .`.
+   Replace the narrow seed (`root_module_root_uri` + optional `target_module_root_uri`) with an all-modules seed derived from `build_config.modules.map.keys()`. Lock the build config via `tryLockConfig` (precedent: DocumentStore.zig:119, 1810, 1852, 2146). If `tryLockConfig` returns null, `break :no_build_file` — same safety pattern as `.unresolved`.
+
+   ```zig
+   var found_uris: Uri.ArrayHashMap(void) = .empty;
+   {
+       const build_config = resolved.build_file.tryLockConfig(store.io) orelse break :no_build_file;
+       defer resolved.build_file.unlockConfig(store.io);
+
+       const module_paths = build_config.modules.map.keys();
+       try found_uris.ensureUnusedCapacity(arena, module_paths.len);
+       for (module_paths) |module_path| {
+           const uri: Uri = try .fromPath(arena, module_path);
+           found_uris.putAssumeCapacity(uri, {});
+       }
+   }
+   // Forward walk body unchanged (file_imports + resolved_imports union with isInStd guard).
+   ```
+
+   Delete the now-redundant root/target module seed blocks. The forward-walk loop body (file_imports union + resolved_imports snapshot with isInStd skip) stays identical.
+
+7. **Forge demo re-run** — after implementation, re-run `incomingCalls` on `algorithms.findBridges` at `forge_worktrees/optimize/zig/forge_graph_zig/src/algorithms.zig:164`. Expected: the call site in `edge_metrics.zig:138` appears. Forge's build.zig declares `src/edge_metrics.zig` as its own module root (L321), so seeding from all module roots makes it immediately visible.
+
+8. **Verify all tests pass** — `zig build test --summary all`, `zig build check`, `zig fmt --check .`.
 
 ## Success Criteria
 
 - [ ] New test fixture `tests/fixtures/module_imports/` checked in with build.zig + multi-module structure
 - [ ] Test helper for constructing a fake resolved BuildConfig added and reusable
-- [ ] TDD: failing test precedes implementation for each requirement (R-M1 through R-M5)
+- [ ] TDD: failing test precedes implementation for each requirement (R-M1 through R-M7)
 - [ ] `resolved_imports` field added to `DocumentStore.Handle`, thread-safe
 - [ ] `uriFromImportStr` populates `resolved_imports` on successful resolution across all paths
 - [ ] `gatherWorkspaceReferenceCandidates` both paths union `resolved_imports` into candidate set
+- [ ] Build-system path seeds from **all** module roots in resolved BuildConfig (R-M6), not just root/target module roots
 - [ ] Invalidation on re-parse — resolved_imports moved to old_handle in `Handle.refresh`, freed in `Handle.deinit`
-- [ ] Cross-module findReferences test passes
+- [ ] Cross-module findReferences test passes (call-site query)
+- [ ] Definition-query test passes (cursor on target definition, caller imports by module name, resolved BuildConfig)
 - [ ] Invalidation test passes
 - [ ] Unresolved-build regression test passes
-- [ ] Std pollution regression test passes (candidate set stays bounded when `resolved_imports` contains std URI)
+- [ ] Std pollution regression test passes (candidate set stays bounded when `resolved_imports` contains std URI) — R-M7
 - [ ] No memory leaks reported by the test allocator (`std.testing.allocator`) — covers dedup `getOrPut` pattern and all URI dupes
 - [ ] Forge-codebase demo: `incomingCalls` on `algorithms.findBridges` returns callers including `edge_metrics.zig:138`
 - [ ] `zig build test --summary all` passes
@@ -169,3 +196,4 @@ Parent: zls-gyi.
 FORGE DEMO BLOCKER: (1) killed zls processes to force binary reload, LSP tool stuck at 'server is running' - user may need to restart. (2) Analysis of walk direction reveals Shape B's fix is insufficient for incomingCalls-from-definition scenario in multi-module projects with resolved BuildConfig. Build-system path does forward walk from root_handle's module root; when root=target=algorithms_handle in forge, walk starts at algorithms.zig module root, resolved_imports adds graph/topology/etc (forward deps), but edge_metrics.zig is NOT reachable forward - it's a reverse caller. Fix works for (a) cursor on CALL SITE (root != target, target module root added to walk), or (b) fallback path (reverse walk). Does NOT work for cursor on DEFINITION with resolved build.
 
 SCOPE DECISION NEEDED from user: accept this limitation and ship, or extend scope to fix definition-query case (would need isAssociatedWith or gatherWorkspaceReferenceCandidates seed enhancement).
+- [2026-04-15T17:01:32Z] [Seth] Scope extension approved 2026-04-15: adding R-M6 (definition-query in multi-module builds) and R-M7 (std-pollution regression test). Option A chosen for R-M6: seed gatherWorkspaceReferenceCandidates build-system path from all modules in resolved BuildConfig (build_config.modules.map.keys()), mirroring isAssociatedWith pattern at DocumentStore.zig:95-152. Forge ground truth: edge_metrics.zig declared as module at build.zig:321, algorithms.zig at build.zig:308 — seeding from all roots immediately includes both, fixing the cursor-on-definition case. Alternatives rejected: Option B (unify reverse-dependants, 50+ LOC refactor, loses build-scoping), Option D (force fallback for definition queries, loses build-scoping entirely). TDD: two new failing tests required before impl.

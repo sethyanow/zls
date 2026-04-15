@@ -325,7 +325,9 @@ fn symbolReferences(
     return builder.locations;
 }
 
-fn gatherWorkspaceReferenceCandidates(
+// Exposed as `pub` for direct test access (zls-mxw R-M7 std-pollution regression).
+// Non-logic change — purely a visibility bump. No behavioural change.
+pub fn gatherWorkspaceReferenceCandidates(
     store: *DocumentStore,
     arena: std.mem.Allocator,
     /// The file on which the request was initiated.
@@ -345,19 +347,28 @@ fn gatherWorkspaceReferenceCandidates(
             .resolved => |resolved| resolved,
         };
 
-        const root_module_root_uri: Uri = try .fromPath(arena, resolved.root_source_file);
-
+        // R-M6: seed the forward walk from ALL module roots in the resolved
+        // BuildConfig, not just root_handle's module root. The earlier narrow
+        // seed (root + optional target module root) couldn't reach reverse
+        // callers in other modules when cursor was on a definition
+        // (root == target): forward walk from one module root never crosses
+        // back out to its importers. Seeding every module root makes each
+        // module's importers directly walkable.
+        //
+        // Mirrors the pattern at `DocumentStore.BuildFile.isAssociatedWith`
+        // (src/DocumentStore.zig:95-152). If `tryLockConfig` can't acquire,
+        // fall through to the fallback path — same safety semantics as the
+        // `.unresolved` branch above.
         var found_uris: Uri.ArrayHashMap(void) = .empty;
-        try found_uris.put(arena, root_module_root_uri, {});
+        {
+            const build_config = resolved.build_file.tryLockConfig(store.io) orelse break :no_build_file;
+            defer resolved.build_file.unlockConfig(store.io);
 
-        if (!root_handle.uri.eql(target_handle.uri)) {
-            switch (try target_handle.getAssociatedBuildFile(store)) {
-                .unresolved, .none => {},
-                .resolved => |resolved2| {
-                    const target_module_root_uri: Uri = try .fromPath(arena, resolved2.root_source_file);
-                    // also search through the module in which the symbol has been defined
-                    try found_uris.put(arena, target_module_root_uri, {});
-                },
+            const module_paths = build_config.modules.map.keys();
+            try found_uris.ensureUnusedCapacity(arena, module_paths.len);
+            for (module_paths) |module_path| {
+                const module_uri: Uri = try .fromPath(arena, module_path);
+                found_uris.putAssumeCapacity(module_uri, {});
             }
         }
 
