@@ -10,6 +10,7 @@ parent: zls-gyi
 
 
 
+
 ## Context
 
 Phase 2 acceptance demo (`zls-pun`) exposed a real R2/R3 gap: `incomingCalls` on a function defined in a module-imported file returns empty when the caller imports by module name (`@import("algorithms")`) rather than file path (`@import("algorithms.zig")`).
@@ -197,3 +198,4 @@ FORGE DEMO BLOCKER: (1) killed zls processes to force binary reload, LSP tool st
 
 SCOPE DECISION NEEDED from user: accept this limitation and ship, or extend scope to fix definition-query case (would need isAssociatedWith or gatherWorkspaceReferenceCandidates seed enhancement).
 - [2026-04-15T17:01:32Z] [Seth] Scope extension approved 2026-04-15: adding R-M6 (definition-query in multi-module builds) and R-M7 (std-pollution regression test). Option A chosen for R-M6: seed gatherWorkspaceReferenceCandidates build-system path from all modules in resolved BuildConfig (build_config.modules.map.keys()), mirroring isAssociatedWith pattern at DocumentStore.zig:95-152. Forge ground truth: edge_metrics.zig declared as module at build.zig:321, algorithms.zig at build.zig:308 — seeding from all roots immediately includes both, fixing the cursor-on-definition case. Alternatives rejected: Option B (unify reverse-dependants, 50+ LOC refactor, loses build-scoping), Option D (force fallback for definition queries, loses build-scoping entirely). TDD: two new failing tests required before impl.
+- [2026-04-15T17:15:38Z] [Seth] Forge demo partial (ephemeral LSP session constraint). Tests green after R-M6 seed-all-modules fix (653/664 suite, 11 skip, 0 fail). Forge real-world probe results: (1) findReferences from CALL SITE at edge_metrics.zig:138:37 returns BOTH files (algorithms.zig:164 + edge_metrics.zig:138) — proves module-name import walking + seed-all-modules are active end-to-end. (2) findReferences/incomingCalls from DEFINITION at algorithms.zig:164:8 returns only the definition. Diagnosis: each LSP tool invocation spawns an ephemeral ZLS process. Build runner doesn't complete in the call's lifetime → build config stays .unresolved → falls through to fallback path → only algorithms.zig is in the store (the file the request opened) → no candidate callers. The build-system path in our fix would seed all module roots (including edge_metrics.zig) from modules.map, but never reached because config isn't resolved yet. Fix is mathematically correct per tests — verification of criterion #13 requires a persistent editor LSP session where the build runner has completed. Not achievable via this LSP tool. Handing off.
