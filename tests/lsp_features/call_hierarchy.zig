@@ -948,6 +948,248 @@ test "outgoing: mixed resolved and unresolved callees" {
     });
 }
 
+// -----------------------------------------------------------------------------
+// outgoing decoder adversarial battery (zls-a9k post-TDD)
+// -----------------------------------------------------------------------------
+// outgoingCallsHandler shares decodeItemData with incomingCallsHandler but
+// is a separate code path. These tests prove outgoing rejects malformed
+// Item.data with the same shape-strict gate.
+
+fn expectOutgoingCallsDataRejected(data: ?types.LSPAny) !void {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = "fn dummy() void {}" });
+    const zero_pos: types.Position = .{ .line = 0, .character = 0 };
+    const zero_range: types.Range = .{ .start = zero_pos, .end = zero_pos };
+
+    const item: types.call_hierarchy.Item = .{
+        .name = "dummy",
+        .kind = .Function,
+        .uri = uri.raw,
+        .range = zero_range,
+        .selectionRange = zero_range,
+        .data = data,
+    };
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        types.call_hierarchy.OutgoingCallsParams{ .item = item },
+    );
+    try std.testing.expect(response == null);
+}
+
+test "outgoing decoder: data = null" {
+    try expectOutgoingCallsDataRejected(null);
+}
+
+test "outgoing decoder: data is not a JSON object" {
+    try expectOutgoingCallsDataRejected(.{ .integer = 42 });
+}
+
+test "outgoing decoder: empty object (missing uri and node)" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: object missing node field" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: object missing uri field" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("node", .{ .integer = 0 });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: node value is a string, not integer" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .string = "0" });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: uri value is an integer, not string" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .integer = 42 });
+    try obj.put("node", .{ .integer = 0 });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: negative node integer" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .integer = -1 });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: node integer overflows u32" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "untitled:///Untitled-0.zig" });
+    try obj.put("node", .{ .integer = 9_999_999_999 });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: uri does not map to a loaded handle" {
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = "file:///this/path/does/not/exist.zig" });
+    try obj.put("node", .{ .integer = 0 });
+    try expectOutgoingCallsDataRejected(.{ .object = obj });
+}
+
+test "outgoing decoder: node points at non-callable tag (stale data)" {
+    // Manually construct an Item whose data.node points at a var_decl, NOT a
+    // callable. Outgoing's tag check (mirror of incoming's) should reject.
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri = try ctx.addDocument(.{ .source = "const x = 42;\nfn foo() void {}" });
+    const handle = ctx.server.document_store.getHandle(uri).?;
+    const tree = handle.tree;
+
+    var var_decl_node: std.zig.Ast.Node.Index = @enumFromInt(0);
+    var found = false;
+    for (0..tree.nodes.len) |i| {
+        const idx: std.zig.Ast.Node.Index = @enumFromInt(@as(u32, @intCast(i)));
+        switch (tree.nodeTag(idx)) {
+            .simple_var_decl, .local_var_decl, .global_var_decl, .aligned_var_decl => {
+                var_decl_node = idx;
+                found = true;
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(found);
+
+    var obj: std.json.ObjectMap = .init(std.testing.allocator);
+    defer obj.deinit();
+    try obj.put("uri", .{ .string = uri.raw });
+    try obj.put("node", .{ .integer = @intCast(@intFromEnum(var_decl_node)) });
+
+    const zero_pos: types.Position = .{ .line = 0, .character = 0 };
+    const zero_range: types.Range = .{ .start = zero_pos, .end = zero_pos };
+    const item: types.call_hierarchy.Item = .{
+        .name = "x",
+        .kind = .Function,
+        .uri = uri.raw,
+        .range = zero_range,
+        .selectionRange = zero_range,
+        .data = .{ .object = obj },
+    };
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        types.call_hierarchy.OutgoingCallsParams{ .item = item },
+    );
+    try std.testing.expect(response == null);
+}
+
+// -----------------------------------------------------------------------------
+// outgoing stress adversarial (zls-a9k post-TDD)
+// -----------------------------------------------------------------------------
+
+test "outgoing adversarial: idempotent — two calls on same Item" {
+    // Second-run pattern: same Item, two outgoingCalls calls, identical results.
+    // Catches accidental state mutation in the handler (e.g., consuming an
+    // iterator twice, or arena state crossing requests).
+    const source =
+        \\fn callee() void {}
+        \\fn <>target() void { callee(); }
+    ;
+
+    var phr = try helper.collectClearPlaceholders(allocator, source);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        types.call_hierarchy.PrepareParams{
+            .textDocument = .{ .uri = test_uri.raw },
+            .position = position,
+        },
+    );
+    const items = prepared orelse return error.PrepareFailed;
+
+    // First call.
+    const first = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        types.call_hierarchy.OutgoingCallsParams{ .item = items[0] },
+    );
+    const first_calls = first orelse return error.InvalidResponse;
+
+    // Second call — same Item (same data payload).
+    const second = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        types.call_hierarchy.OutgoingCallsParams{ .item = items[0] },
+    );
+    const second_calls = second orelse return error.InvalidResponse;
+
+    try std.testing.expectEqual(first_calls.len, second_calls.len);
+    try std.testing.expectEqual(@as(usize, 1), first_calls.len);
+    try std.testing.expectEqualStrings(first_calls[0].to.name, second_calls[0].to.name);
+    try std.testing.expectEqual(first_calls[0].fromRanges.len, second_calls[0].fromRanges.len);
+}
+
+test "outgoing adversarial: quoted-identifier callee with multi-byte chars" {
+    // Encoding boundary: callee name contains non-ASCII bytes inside `@"..."`.
+    // resolveCallee → ast.identifierTokenFromIdentifierNode + lookupSymbolGlobal
+    // must do byte-identical matching for Zig identifiers.
+    try testOutgoingCalls(
+        \\fn @"αβ"() void {}
+        \\fn <>target() void { @"αβ"(); }
+    , &.{
+        .{
+            .name = "@\"αβ\"",
+            .from_ranges = &.{"@\"αβ\"()"},
+        },
+    });
+}
+
+test "outgoing adversarial: dense — six distinct callees in target body" {
+    // Stress the bucket-grouping linear-scan path — each callee comparison
+    // must fall through to a new-bucket branch six times. Proves the O(callees²)
+    // grouping is correct (and tractable) at moderate scale.
+    try testOutgoingCalls(
+        \\fn a() void {}
+        \\fn b() void {}
+        \\fn c() void {}
+        \\fn d() void {}
+        \\fn e() void {}
+        \\fn f() void {}
+        \\fn <>target() void {
+        \\    a(); b(); c(); d(); e(); f();
+        \\}
+    , &.{
+        .{ .name = "a", .from_ranges = &.{"a()"} },
+        .{ .name = "b", .from_ranges = &.{"b()"} },
+        .{ .name = "c", .from_ranges = &.{"c()"} },
+        .{ .name = "d", .from_ranges = &.{"d()"} },
+        .{ .name = "e", .from_ranges = &.{"e()"} },
+        .{ .name = "f", .from_ranges = &.{"f()"} },
+    });
+}
+
 fn testIncomingCalls(source: []const u8, expected: []const ExpectedCaller) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
