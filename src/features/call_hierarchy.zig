@@ -292,3 +292,175 @@ pub fn incomingCallsHandler(
     }
     return out;
 }
+
+/// Resolve a `.call*` node's callee to a `DeclWithHandle`. Mirror of
+/// `references.zig:614-647` (CallBuilder.referenceNode's .identifier and
+/// .field_access branches) WITHOUT the target_decl.eql filter — outgoing accepts
+/// every resolved callee, not just those equal to a target.
+///
+/// Returns null for unresolved or non-resolvable callees:
+/// - paren-wrapped: `(f)()` — fn_expr is a paren expr, not .identifier
+/// - anonymous fn literal: `(fn() void {})()` — fn_expr is .fn_proto*
+/// - method/call chains: `get_fn().run()` — fn_expr is itself a call expression
+/// - undefined identifier: lookupSymbolGlobal returns null
+/// - field_access where LHS type cannot be resolved
+///
+/// Per the design: silent null return is a deliberate choice, NOT an error swallow.
+fn resolveCallee(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    call_node: Ast.Node.Index,
+) Analyser.Error!?Analyser.DeclWithHandle {
+    const tree = &handle.tree;
+    var buf: [1]Ast.Node.Index = undefined;
+    const call = tree.fullCall(&buf, call_node).?; // caller has filtered to .call*
+
+    const called_node = call.ast.fn_expr;
+    switch (tree.nodeTag(called_node)) {
+        .identifier => {
+            const identifier_token = ast.identifierTokenFromIdentifierNode(tree, called_node) orelse return null;
+            return try analyser.lookupSymbolGlobal(
+                handle,
+                offsets.identifierTokenToNameSlice(tree, identifier_token),
+                tree.tokenStart(identifier_token),
+            );
+        },
+        .field_access => {
+            const lhs_node, const field_name = tree.nodeData(called_node).node_and_token;
+            const lhs = (try analyser.resolveTypeOfNode(.of(lhs_node, handle))) orelse return null;
+            const deref_lhs = try analyser.resolveDerefType(lhs) orelse lhs;
+            const symbol = offsets.tokenToSlice(tree, field_name);
+            return try deref_lhs.lookupSymbol(analyser, symbol);
+        },
+        else => return null,
+    }
+}
+
+/// Returns the body node to walk for outgoingCalls — the inner block of fn_decl,
+/// test_decl, or comptime. Returns null for fn_proto* variants (no body) and any
+/// non-callable tag (the handler's upstream tag filter prevents those reaching here,
+/// but the `else` branch is the safety net).
+fn bodyNodeFor(tree: *const Ast, node: Ast.Node.Index) ?Ast.Node.Index {
+    switch (tree.nodeTag(node)) {
+        // .node_and_node[1] is the body block (first is the fn_proto prototype).
+        .fn_decl => return tree.nodeData(node).node_and_node[1],
+        // .opt_token_and_node[0] is the optional name token (Task 1 uses this);
+        // [1] is the body block — always present per the Ast schema.
+        .test_decl => return tree.nodeData(node).opt_token_and_node[1],
+        .@"comptime" => return tree.nodeData(node).node,
+        // Prototype-only nodes (extern fns, fn types) — no body to walk.
+        .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple => return null,
+        else => return null,
+    }
+}
+
+pub fn outgoingCallsHandler(
+    server: *Server,
+    arena: std.mem.Allocator,
+    request: types.call_hierarchy.OutgoingCallsParams,
+) Server.Error!?[]const types.call_hierarchy.OutgoingCall {
+    // Decode Item.data — null for malformed payloads (per LSP etiquette client can re-prepare).
+    const decoded = decodeItemData(request.item.data) orelse return null;
+
+    const document_uri = Uri.parse(arena, decoded.uri_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    const handle = server.document_store.getHandle(document_uri) orelse return null;
+    const tree = &handle.tree;
+
+    // Bounds + staleness check — same shape as incomingCallsHandler.
+    if (@intFromEnum(decoded.node) >= tree.nodes.len) return null;
+    const tag = tree.nodeTag(decoded.node);
+    switch (tag) {
+        .fn_decl,
+        .fn_proto,
+        .fn_proto_one,
+        .fn_proto_multi,
+        .fn_proto_simple,
+        .test_decl,
+        .@"comptime",
+        => {},
+        else => return null,
+    }
+
+    // No body to walk → applicable but no callees. Return empty slice, NOT null.
+    const body_node = bodyNodeFor(tree, decoded.node) orelse return &.{};
+
+    var analyser = server.initAnalyser(arena, handle);
+    defer analyser.deinit();
+
+    // Walk the body collecting `.call*` nodes. Skip the body root itself.
+    var call_nodes: std.ArrayList(Ast.Node.Index) = .empty;
+    {
+        var walker: ast.Walker = try .init(arena, tree, body_node);
+        defer walker.deinit(arena);
+        while (try walker.next(arena, tree)) |event| switch (event) {
+            .open => |descendant| {
+                if (descendant == body_node) continue;
+                switch (tree.nodeTag(descendant)) {
+                    .call, .call_comma, .call_one, .call_one_comma => {
+                        try call_nodes.append(arena, descendant);
+                    },
+                    else => {},
+                }
+            },
+            .close => {},
+        };
+    }
+
+    // Group by resolved callee decl. Linear-scan bucketing — same pattern as
+    // incomingCallsHandler. Buckets carry the ast_node so we can build the Item later.
+    const Bucket = struct {
+        callee: Analyser.DeclWithHandle,
+        callee_ast_node: Ast.Node.Index,
+        ranges: std.ArrayList(types.Range),
+    };
+    var buckets: std.ArrayList(Bucket) = .empty;
+
+    outer: for (call_nodes.items) |call_node| {
+        const callee = (try resolveCallee(&analyser, handle, call_node)) orelse continue;
+        // Only `.ast_node` decls have a node we can pass to buildItemIfCallable.
+        // Function-parameter, capture, and label decls have no AST node to point at.
+        const callee_ast_node = switch (callee.decl) {
+            .ast_node => |n| n,
+            else => continue,
+        };
+        const range = offsets.nodeToRange(tree, call_node, server.offset_encoding);
+
+        for (buckets.items) |*bucket| {
+            if (bucket.callee.eql(callee)) {
+                try bucket.ranges.append(arena, range);
+                continue :outer;
+            }
+        }
+
+        var ranges: std.ArrayList(types.Range) = .empty;
+        try ranges.append(arena, range);
+        try buckets.append(arena, .{
+            .callee = callee,
+            .callee_ast_node = callee_ast_node,
+            .ranges = ranges,
+        });
+    }
+
+    // Build OutgoingCalls. Skip buckets whose callee can't be represented as an Item
+    // (e.g., callee resolves to a var_decl holding a fn value — not a callable tag).
+    var out: std.ArrayList(types.call_hierarchy.OutgoingCall) = .empty;
+    try out.ensureTotalCapacityPrecise(arena, buckets.items.len);
+    for (buckets.items) |bucket| {
+        const to_item = (try buildItemIfCallable(
+            arena,
+            bucket.callee.handle.uri,
+            &bucket.callee.handle.tree,
+            bucket.callee_ast_node,
+            null,
+            server.offset_encoding,
+        )) orelse continue;
+        out.appendAssumeCapacity(.{
+            .to = to_item,
+            .fromRanges = bucket.ranges.items,
+        });
+    }
+    return out.items;
+}

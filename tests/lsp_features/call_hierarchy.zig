@@ -725,6 +725,229 @@ test "incoming: cross-file caller via @import" {
     try std.testing.expectEqualStrings("a.target()", got_slice);
 }
 
+// -----------------------------------------------------------------------------
+// outgoingCalls — RED test for single callee (zls-a9k)
+// -----------------------------------------------------------------------------
+
+const ExpectedCallee = struct {
+    /// Exact name field on the OutgoingCall.to Item.
+    name: []const u8,
+    /// Each entry is the exact source slice (in the TARGET's file) the
+    /// fromRange should cover.
+    from_ranges: []const []const u8,
+};
+
+test "outgoing: single callee, one call site" {
+    try testOutgoingCalls(
+        \\fn callee() void {}
+        \\fn <>target() void { callee(); }
+    , &.{
+        .{
+            .name = "callee",
+            .from_ranges = &.{"callee()"},
+        },
+    });
+}
+
+test "outgoing: multiple calls to same callee collapse into one OutgoingCall" {
+    try testOutgoingCalls(
+        \\fn c() void {}
+        \\fn <>t() void {
+        \\    c();
+        \\    c();
+        \\    c();
+        \\}
+    , &.{
+        .{
+            .name = "c",
+            .from_ranges = &.{ "c()", "c()", "c()" },
+        },
+    });
+}
+
+test "outgoing: cross-file callee via @import" {
+    // File A defines the callee. File B imports A and the target calls a.callee().
+    // outgoingCalls on the target in B should return an OutgoingCall whose `to`
+    // Item points at File A's URI.
+    const source_a = "pub fn callee() void {}";
+    const source_b =
+        \\const a = @import("Untitled-0.zig");
+        \\fn <>target() void { a.callee(); }
+    ;
+
+    var phr = try helper.collectClearPlaceholders(allocator, source_b);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const uri_a = try ctx.addDocument(.{ .source = source_a });
+    const uri_b = try ctx.addDocument(.{ .source = phr.new_source });
+
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        types.call_hierarchy.PrepareParams{
+            .textDocument = .{ .uri = uri_b.raw },
+            .position = position,
+        },
+    );
+    const items = prepared orelse return error.PrepareFailed;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        types.call_hierarchy.OutgoingCallsParams{ .item = items[0] },
+    );
+    const calls = response orelse return error.InvalidResponse;
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+
+    try std.testing.expectEqualStrings("callee", calls[0].to.name);
+    try std.testing.expectEqualStrings(uri_a.raw, calls[0].to.uri);
+    try std.testing.expectEqual(@as(usize, 1), calls[0].fromRanges.len);
+
+    // The fromRange covers `a.callee()` in File B — fromRanges are in the TARGET's file.
+    const got_slice = offsets.rangeToSlice(phr.new_source, calls[0].fromRanges[0], ctx.server.offset_encoding);
+    try std.testing.expectEqualStrings("a.callee()", got_slice);
+}
+
+test "outgoing: field_access callee (method on struct)" {
+    // Verifies resolveCallee's .field_access branch. The callee `s.foo()` is
+    // resolved via resolveTypeOfNode(s) → S type → lookupSymbol("foo") → fn_decl.
+    try testOutgoingCalls(
+        \\const S = struct {
+        \\    pub fn foo(self: S) void { _ = self; }
+        \\};
+        \\fn <>target() void {
+        \\    var s: S = undefined;
+        \\    s.foo();
+        \\}
+    , &.{
+        .{
+            .name = "foo",
+            .from_ranges = &.{"s.foo()"},
+        },
+    });
+}
+
+test "outgoing: test_decl walks the test body" {
+    // Differs from incomingCalls (which returns empty for test_decl) — outgoing
+    // walks the test body for callees just like fn_decl.
+    try testOutgoingCalls(
+        \\fn foo() void {}
+        \\test "<>named" { foo(); }
+    , &.{
+        .{
+            .name = "foo",
+            .from_ranges = &.{"foo()"},
+        },
+    });
+}
+
+test "outgoing: comptime block walks the block body" {
+    // Same divergence from incoming as test_decl — outgoing walks comptime bodies.
+    try testOutgoingCalls(
+        \\fn foo() void {}
+        \\<>comptime { foo(); }
+    , &.{
+        .{
+            .name = "foo",
+            .from_ranges = &.{"foo()"},
+        },
+    });
+}
+
+test "outgoing: extern fn (no body) returns empty slice (not null)" {
+    // fn_proto without a fn_decl wrapper has no body. Per the design contract,
+    // bodyNodeFor returns null → handler returns empty slice. Item is valid;
+    // there are simply no callees to find. Empty != null: null means "data
+    // malformed", empty means "applicable, no callees".
+    try testOutgoingCalls(
+        \\extern fn <>ext(a: i32) i32;
+    , &.{});
+}
+
+test "outgoing: anonymous fn literal callee is silently skipped" {
+    // `(fn() void {})()` — called_node is fn_proto (anonymous), no name token,
+    // not .identifier and not .field_access → resolveCallee returns null.
+    try testOutgoingCalls(
+        \\fn <>target() void {
+        \\    (fn() void {})();
+        \\}
+    , &.{});
+}
+
+test "outgoing: paren-wrapped identifier callee is silently skipped" {
+    // `(g)()` — called_node is .grouped_expression (a paren wrap), not
+    // .identifier directly. resolveCallee falls through to its switch default.
+    // Documented as Out-of-Scope per the Adversarial Failure Catalog.
+    try testOutgoingCalls(
+        \\fn g() void {}
+        \\fn <>target() void {
+        \\    (g)();
+        \\}
+    , &.{});
+}
+
+test "outgoing: undefined identifier callee is silently skipped" {
+    // `not_defined()` — called_node IS .identifier, but lookupSymbolGlobal
+    // returns null. resolveCallee propagates null.
+    try testOutgoingCalls(
+        \\fn <>target() void {
+        \\    not_defined();
+        \\}
+    , &.{});
+}
+
+test "outgoing: distinct callees produce distinct OutgoingCalls" {
+    // Verifies the bucket-creation path. Without this test, a buggy implementation
+    // that always reuses the first bucket would still pass single-callee and
+    // multi-call-collapse tests.
+    try testOutgoingCalls(
+        \\fn a() void {}
+        \\fn b() void {}
+        \\fn c() void {}
+        \\fn <>target() void {
+        \\    a();
+        \\    b();
+        \\    c();
+        \\}
+    , &.{
+        .{ .name = "a", .from_ranges = &.{"a()"} },
+        .{ .name = "b", .from_ranges = &.{"b()"} },
+        .{ .name = "c", .from_ranges = &.{"c()"} },
+    });
+}
+
+test "outgoing: recursive self-call appears as outgoing pointing back at target" {
+    // Per LSP semantics, recursive calls are first-class outgoing — the bucket
+    // grouping doesn't dedup against the target's own decl.
+    try testOutgoingCalls(
+        \\fn <>rec() void { rec(); }
+    , &.{
+        .{ .name = "rec", .from_ranges = &.{"rec()"} },
+    });
+}
+
+test "outgoing: mixed resolved and unresolved callees" {
+    // The unresolved `not_defined()` call is silently skipped without affecting
+    // the bucket for the resolved `known()` calls. Catches a class of bugs where
+    // null-callee handling accidentally short-circuits the loop or contaminates
+    // the bucket.
+    try testOutgoingCalls(
+        \\fn known() void {}
+        \\fn <>target() void {
+        \\    known();
+        \\    not_defined();
+        \\    known();
+        \\}
+    , &.{
+        .{ .name = "known", .from_ranges = &.{ "known()", "known()" } },
+    });
+}
+
 fn testIncomingCalls(source: []const u8, expected: []const ExpectedCaller) !void {
     var phr = try helper.collectClearPlaceholders(allocator, source);
     defer phr.deinit(allocator);
@@ -770,6 +993,59 @@ fn testIncomingCalls(source: []const u8, expected: []const ExpectedCaller) !void
     try std.testing.expectEqual(expected.len, calls.len);
     for (expected, calls) |exp, got| {
         try std.testing.expectEqualStrings(exp.name, got.from.name);
+        try std.testing.expectEqual(@as(usize, exp.from_ranges.len), got.fromRanges.len);
+        for (exp.from_ranges, got.fromRanges) |exp_range, got_range| {
+            const got_slice = offsets.rangeToSlice(phr.new_source, got_range, ctx.server.offset_encoding);
+            try std.testing.expectEqualStrings(exp_range, got_slice);
+        }
+    }
+}
+
+fn testOutgoingCalls(source: []const u8, expected: []const ExpectedCallee) !void {
+    var phr = try helper.collectClearPlaceholders(allocator, source);
+    defer phr.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    const test_uri = try ctx.addDocument(.{ .source = phr.new_source });
+    const position = offsets.locToRange(phr.new_source, phr.locations.items(.new)[0], .@"utf-16").start;
+
+    // Phase 1: prepare to obtain the target Item (with Item.data encoded).
+    const prepare_params: types.call_hierarchy.PrepareParams = .{
+        .textDocument = .{ .uri = test_uri.raw },
+        .position = position,
+    };
+    const prepared = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/prepareCallHierarchy",
+        prepare_params,
+    );
+    const items = prepared orelse {
+        std.debug.print("prepareCallHierarchy returned null — test setup is wrong\n", .{});
+        return error.PrepareFailed;
+    };
+    if (items.len == 0) return error.PrepareReturnedEmpty;
+    const target_item = items[0];
+
+    // Phase 2: outgoingCalls on the prepared Item.
+    const outgoing_params: types.call_hierarchy.OutgoingCallsParams = .{
+        .item = target_item,
+    };
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "callHierarchy/outgoingCalls",
+        outgoing_params,
+    );
+
+    const calls: []const types.call_hierarchy.OutgoingCall = response orelse {
+        std.debug.print("outgoingCalls returned null but expected {d} callee(s)\n", .{expected.len});
+        return error.InvalidResponse;
+    };
+
+    try std.testing.expectEqual(expected.len, calls.len);
+    for (expected, calls) |exp, got| {
+        try std.testing.expectEqualStrings(exp.name, got.to.name);
         try std.testing.expectEqual(@as(usize, exp.from_ranges.len), got.fromRanges.len);
         for (exp.from_ranges, got.fromRanges) |exp_range, got_range| {
             const got_slice = offsets.rangeToSlice(phr.new_source, got_range, ctx.server.offset_encoding);

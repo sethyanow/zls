@@ -1593,6 +1593,10 @@ fn incomingCallsHandler(server: *Server, arena: std.mem.Allocator, request: type
     return try @import("features/call_hierarchy.zig").incomingCallsHandler(server, arena, request);
 }
 
+fn outgoingCallsHandler(server: *Server, arena: std.mem.Allocator, request: types.call_hierarchy.OutgoingCallsParams) Error!?[]const types.call_hierarchy.OutgoingCall {
+    return try @import("features/call_hierarchy.zig").outgoingCallsHandler(server, arena, request);
+}
+
 const HandledRequestParams = union(enum) {
     initialize: types.InitializeParams,
     shutdown,
@@ -1618,6 +1622,7 @@ const HandledRequestParams = union(enum) {
     @"textDocument/selectionRange": types.SelectionRange.Params,
     @"textDocument/prepareCallHierarchy": types.call_hierarchy.PrepareParams,
     @"callHierarchy/incomingCalls": types.call_hierarchy.IncomingCallsParams,
+    @"callHierarchy/outgoingCalls": types.call_hierarchy.OutgoingCallsParams,
     @"workspace/symbol": types.workspace.Symbol.Params,
     other: lsp.MethodWithParams,
 };
@@ -1665,6 +1670,7 @@ fn isBlockingMessage(msg: Message) bool {
             .@"textDocument/selectionRange",
             .@"textDocument/prepareCallHierarchy",
             .@"callHierarchy/incomingCalls",
+            .@"callHierarchy/outgoingCalls",
             .@"workspace/symbol",
             => return false,
             .other => return false,
@@ -1837,6 +1843,7 @@ pub fn sendRequestSync(server: *Server, arena: std.mem.Allocator, comptime metho
         .@"textDocument/selectionRange" => try server.selectionRangeHandler(arena, params),
         .@"textDocument/prepareCallHierarchy" => try server.prepareCallHierarchyHandler(arena, params),
         .@"callHierarchy/incomingCalls" => try server.incomingCallsHandler(arena, params),
+        .@"callHierarchy/outgoingCalls" => try server.outgoingCallsHandler(arena, params),
         .@"workspace/symbol" => try server.workspaceSymbolHandler(arena, params),
         .other => return null,
     };
