@@ -1,11 +1,12 @@
 ---
 id: zls-mxw
 title: 'Phase 2 Task 4: Module-import coverage in reverse reference search'
-status: active
+status: closed
 type: task
 priority: 1
 parent: zls-gyi
 ---
+
 
 ## Context
 
