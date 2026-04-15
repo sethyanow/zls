@@ -17,7 +17,7 @@ Phase 2 of zls-xjj (Call Hierarchy Implementation) has three implementation task
 - **zls-mxw** — module-import coverage in reverse reference search (Shape B: lazy `resolved_imports` cache on Handle populated via `uriFromImportStr`).
 - **zls-029** — findReferences on `@import` string literals as a distinct first-class feature.
 
-This task is the user-facing acceptance step once both blockers land: agent documentation + narrated LSP tool walkthrough against real ZLS symbols AND against a foreign multi-module Zig codebase (forge_graph_zig) that exercises the module-import path.
+This task is the user-facing acceptance step once both blockers land: agent documentation + narrated LSP tool walkthrough against real ZLS symbols AND against the in-repo `tests/fixtures/module_imports/` fixture that exercises the module-name import path.
 
 ## Agent Documentation (complete before presenting demo)
 
@@ -74,15 +74,15 @@ Live narrated LSP tool walkthrough. The agent runs each step, names the symbol a
 - Target: a variable name or a string literal
 - Expected: `prepareCallHierarchy` returns null (or an empty result), confirming the handler rejects non-callable positions.
 
-**Demo 8 — Foreign-codebase module imports (blocked by zls-mxw)**
-- Target: `findBridges` at `/Volumes/code/forge_worktrees/optimize/zig/forge_graph_zig/src/algorithms.zig:164`
-- Before zls-mxw: `incomingCalls` returned empty because the caller `edge_metrics.zig:138` imports `algorithms` by module name, not by `.zig` path.
-- Expected after zls-mxw: `incomingCalls` returns the call site in `edge_metrics.zig:138`, plus all test-file call sites in `test/algorithms_tests.zig`.
-- Narration: shows that Phase 2's R2/R3 ("spanning all files reachable via the import graph") is actually met for real-world multi-module Zig projects, not just for self-hosted ZLS.
+**Demo 8 — Module-name import coverage (blocked by zls-mxw)**
+- Target: `doubled` at `tests/fixtures/module_imports/b.zig:1`
+- Before zls-mxw: `incomingCalls` returned empty because the caller `a.zig:4` (`mod_b.doubled(x)`) imports `mod_b` by module name, not by `.zig` path.
+- Expected after zls-mxw: `incomingCalls` returns the call site at `tests/fixtures/module_imports/a.zig:4`, proving the `resolved_imports` cache + seed-all-modules (R-M6) work end-to-end in a live LSP session with a resolved BuildConfig.
+- Narration: shows that Phase 2's R2/R3 ("spanning all files reachable via the import graph") is actually met for module-name imports, not just file-path imports covered by Phase 1.
 
 **Demo 9 — findReferences on an `@import` string literal (blocked by zls-029)**
-- Target: `@import("algorithms")` in `edge_metrics.zig` (or similar string-literal position in the forge fixture)
-- Expected: the result set includes other `@import` string literals across the codebase that resolve to the same `algorithms.zig` URI — file-path and module-name callsites alike, compared by resolved URI.
+- Target: `@import("mod_b")` at `tests/fixtures/module_imports/a.zig:1`
+- Expected: the result set includes every `@import` string literal in the fixture that resolves to the same `b.zig` URI — compared by resolved URI, not by literal text. With the fixture as-is, this is the one literal in `a.zig`; the handler fires, the URI comparison executes, and `prepareRename` returns null on the same position (no rename semantics for import strings).
 - Narration: shows that import relationships are now first-class queryable entities, distinct from symbol references.
 
 ## Sign-Off
@@ -94,7 +94,7 @@ Live narrated LSP tool walkthrough. The agent runs each step, names the symbol a
 - [ ] Demo 5: outgoingCalls cross-file confirmed
 - [ ] Demo 6: test declaration returns valid item
 - [ ] Demo 7: non-callable position returns null
-- [ ] Demo 8: incomingCalls on `algorithms.findBridges` in forge finds callers across module-imported files (zls-mxw landed)
+- [ ] Demo 8: incomingCalls on `doubled` in `tests/fixtures/module_imports/` finds the caller in `a.zig` via module-name import (zls-mxw landed)
 - [ ] Demo 9: findReferences on an `@import` string literal finds cross-file importers by resolved URI (zls-029 landed)
 - [ ] CLAUDE.md updated to mention call_hierarchy.zig
 - [ ] Phase 2 complete — zls-gyi can close, parent epic zls-xjj final demo criterion satisfied
