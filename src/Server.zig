@@ -552,6 +552,7 @@ fn initializeHandler(server: *Server, arena: std.mem.Allocator, request: types.I
             .declarationProvider = .{ .bool = true },
             .definitionProvider = .{ .bool = true },
             .typeDefinitionProvider = .{ .bool = true },
+            .callHierarchyProvider = .{ .call_hierarchy_options = .{} },
             .implementationProvider = .{ .bool = false },
             .referencesProvider = .{ .bool = true },
             .documentSymbolProvider = .{ .bool = true },
