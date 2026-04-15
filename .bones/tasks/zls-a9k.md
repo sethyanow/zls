@@ -1,11 +1,14 @@
 ---
 id: zls-a9k
 title: 'Phase 2 Task 3: outgoingCalls handler + callee grouping + capability flip'
-status: open
+status: closed
 type: task
 priority: 1
 parent: zls-gyi
 ---
+
+
+
 
 ## Dependency Gates
 - **Blocked by:** zls-t17 (closed — supplies `buildItemIfCallable` + Item encoding) and zls-239 (closed — supplies `decodeItemData` + the Server.zig 4-site wiring template).
@@ -279,27 +282,27 @@ Differs from incoming where these returned empty — outgoing walks their body.
 
 ## Success Criteria
 
-- [ ] `src/Server.zig` registers `@"callHierarchy/outgoingCalls"` in all 4 sites with thin wrapper `outgoingCallsHandler`
-- [ ] `src/features/call_hierarchy.zig` exports `outgoingCallsHandler` with signature `Server.Error!?[]const types.call_hierarchy.OutgoingCall`
-- [ ] `src/features/call_hierarchy.zig` has private `bodyNodeFor` helper switching on fn_decl / test_decl / @"comptime" / fn_proto variants (no `pub`)
-- [ ] `src/features/call_hierarchy.zig` has private `resolveCallee` helper mirroring CallBuilder.referenceNode's resolution (identifier + field_access) without the target filter (no `pub`)
-- [ ] `outgoingCallsHandler` reuses Task 2's `decodeItemData` for Item.data parsing — no inline JSON decoding
-- [ ] `src/Server.zig` advertises `callHierarchyProvider` in the InitializeResult capabilities block
-- [ ] `src/features/references.zig` is NOT modified by this task — Task 2's CallBuilder + wrapper remain untouched
-- [ ] Test: single callee returns one OutgoingCall with one fromRange
-- [ ] Test: multiple calls to one callee collapse into one OutgoingCall with N fromRanges
-- [ ] Test: multiple distinct callees produce one OutgoingCall each (Step 12.5)
-- [ ] Test: recursive self-call appears as outgoing pointing back at target (Step 12.6)
-- [ ] Test: mixed resolved + unresolved callees — only resolved ones appear, no error (Step 12.7)
-- [ ] Test: cross-file callee via `@import` is found (callee's Item has the other file's URI)
-- [ ] Test: field_access callee (method on struct type) is found
-- [ ] Test: outgoingCalls on test_decl walks the test body
-- [ ] Test: outgoingCalls on comptime block walks the block
-- [ ] Test: outgoingCalls on extern fn_proto (no body) returns empty slice (not null)
-- [ ] Test: unresolved callees (anonymous fn literals, paren-wrapped, undefined identifiers) are silently skipped — empty slice, not error
-- [ ] `zig build test --summary all` passes
-- [ ] `zig build check` compiles clean
-- [ ] `zig fmt --check .` passes
+- [x] `src/Server.zig` registers `@"callHierarchy/outgoingCalls"` in all 4 sites with thin wrapper `outgoingCallsHandler`
+- [x] `src/features/call_hierarchy.zig` exports `outgoingCallsHandler` with signature `Server.Error!?[]const types.call_hierarchy.OutgoingCall`
+- [x] `src/features/call_hierarchy.zig` has private `bodyNodeFor` helper switching on fn_decl / test_decl / @"comptime" / fn_proto variants (no `pub`)
+- [x] `src/features/call_hierarchy.zig` has private `resolveCallee` helper mirroring CallBuilder.referenceNode's resolution (identifier + field_access) without the target filter (no `pub`)
+- [x] `outgoingCallsHandler` reuses Task 2's `decodeItemData` for Item.data parsing — no inline JSON decoding
+- [x] `src/Server.zig` advertises `callHierarchyProvider` in the InitializeResult capabilities block
+- [x] `src/features/references.zig` is NOT modified by this task — Task 2's CallBuilder + wrapper remain untouched
+- [x] Test: single callee returns one OutgoingCall with one fromRange
+- [x] Test: multiple calls to one callee collapse into one OutgoingCall with N fromRanges
+- [x] Test: multiple distinct callees produce one OutgoingCall each (Step 12.5)
+- [x] Test: recursive self-call appears as outgoing pointing back at target (Step 12.6)
+- [x] Test: mixed resolved + unresolved callees — only resolved ones appear, no error (Step 12.7)
+- [x] Test: cross-file callee via `@import` is found (callee's Item has the other file's URI)
+- [x] Test: field_access callee (method on struct type) is found
+- [x] Test: outgoingCalls on test_decl walks the test body
+- [x] Test: outgoingCalls on comptime block walks the block
+- [x] Test: outgoingCalls on extern fn_proto (no body) returns empty slice (not null)
+- [x] Test: unresolved callees (anonymous fn literals, paren-wrapped, undefined identifiers) are silently skipped — empty slice, not error
+- [x] `zig build test --summary all` passes (648/659, 11 skipped)
+- [x] `zig build check` compiles clean
+- [x] `zig fmt --check .` passes
 
 ## Anti-Patterns (FORBIDDEN for this task)
 
@@ -529,3 +532,7 @@ Each component is walked through all six failure categories: Input Hostility, En
 - partialResultToken streaming support (present in OutgoingCallsParams but unimplemented).
 - Main `Builder` rewrite (still deferred — not required for any of Phase 2 tasks).
 - Live narrated LSP demo — that's the acceptance task, scheduled after Task 3 closes.
+
+## Log
+
+- [2026-04-15T08:13:26Z] [Seth] Debrief: All 21 task-local criteria met. 13 happy-path + 14 adversarial = 27 new tests. Full suite 648/659 (11 skipped, 0 fail). Commits: f7447b9d (handler+tests), fa63f2dc (capability flip), e37b6fcb (adversarial battery). Design surprise: opt_token_and_node[1] is Ast.Node.Index (non-optional), not Optional — the skeleton's defensive .unwrap() orelse null was wrong API shape. Caught during compile, fixed in-place. resolveCallee mirrors CallBuilder.referenceNode .identifier+.field_access with Analyser.Error!? return (matches CallBuilder's error signature). Bucket grouping uses DeclWithHandle.eql; var_decl-holding-fn pattern is correctly filtered by buildItemIfCallable's tag check. Three-Question Framework on all 14 GREEN adversarial: decoder+bounds+tag pipeline shape-strict (same gate as incoming), handler stateless across requests (idempotency structural), quoted-identifier works via byte-identical Zig semantics, O(callees²) bucket grouping acceptable at moderate scale. No out-of-scope concerns escalated.

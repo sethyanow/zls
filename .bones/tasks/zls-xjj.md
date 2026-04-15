@@ -37,12 +37,12 @@ R9. Server capabilities shall advertise `callHierarchyProvider` and the three me
 R10. All new functionality shall have LSP feature tests in `tests/lsp_features/call_hierarchy.zig` following the existing test patterns.
 
 ## Success Criteria
-- [ ] `textDocument/prepareCallHierarchy` returns correct items for functions, tests, and comptime blocks
-- [ ] `callHierarchy/incomingCalls` returns callers across multiple files with correct grouping and ranges
-- [ ] `callHierarchy/outgoingCalls` returns callees across multiple files with correct grouping and ranges
+- [x] `textDocument/prepareCallHierarchy` returns correct items for functions, tests, and comptime blocks
+- [x] `callHierarchy/incomingCalls` returns callers across multiple files with correct grouping and ranges
+- [x] `callHierarchy/outgoingCalls` returns callees across multiple files with correct grouping and ranges
 - [ ] `findReferences` cross-file coverage improved (validated by LSP tool demo on real codebase)
-- [ ] `zig build test --summary all` passes with new tests
-- [ ] `zig fmt --check .` passes
+- [x] `zig build test --summary all` passes with new tests
+- [x] `zig fmt --check .` passes
 - [ ] Live narrated LSP tool demo showing call hierarchy on real ZLS functions with cross-file results
 
 ## Anti-Patterns (FORBIDDEN)
