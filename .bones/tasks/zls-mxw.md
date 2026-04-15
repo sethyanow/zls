@@ -8,6 +8,7 @@ parent: zls-gyi
 ---
 
 
+
 ## Context
 
 `incomingCalls` / `findReferences` on a function defined in a module-imported file returned empty when the caller imported by module name (`@import("mod_b")`) rather than file path (`@import("b.zig")`). Surfaced by Phase 2 acceptance work.
@@ -107,3 +108,23 @@ Rationale:
 
 Parent: zls-gyi.
 Blocks: zls-pun.
+
+## Log
+
+- [2026-04-15T20:39:59Z] [Seth] Debrief (verification session): tests re-run fresh — 653/664 passed (11 skip, 0 fail), 57/57 steps succeeded, zig fmt --check clean. Prior agent's claims verified.
+
+Technical debrief:
+- Workarounds: none fragile. Noted limitation (Key Considerations): stale cache on build-config reload without re-parse — bounded, out-of-scope for this task.
+- Design decisions that emerged mid-task: R-M6 scope extension (seed-all-modules for definition-cursor incomingCalls) + R-M7 (std-pollution regression test). User approved Option A over alternatives B (50+ LOC refactor) and D (force fallback).
+- Toolchain surprises: std.Io.Mutex non-re-entrance forced cacheResolvedImport to acquire impl.lock strictly after all tryLockConfig/getAssociatedBuildFile calls have released. getOrPut + dedup-on-found_existing needed to avoid URI-dupe leak.
+- What next task (zls-029) inherits: tests/helper_build.zig (makeResolved, stampResolved) — already cited in zls-029 skeleton. tests/fixtures/module_imports/ reusable. gatherWorkspaceReferenceCandidates now includes resolved_imports edges, so zls-029's candidate walk sees module-name-imported files.
+
+Reflection:
+- Skeleton accuracy: required R-M6 addendum mid-task when adversarial review showed Shape B alone didn't cover incomingCalls-from-definition in multi-module resolved-BuildConfig projects. Skeleton was amended in-flight.
+- Epic freshness: sub-epic zls-gyi only unchecked criterion is the live LSP demo (acceptance task zls-pun). Parent epic zls-xjj has two unchecked: findReferences cross-file coverage demo + live demo — both belong to acceptance.
+- Cross-pollination: helper_build.zig + module_imports fixture are reusable infra for any future build-config-dependent test.
+- User correction: scope extension approved 2026-04-15 — chose fix-now over ship-with-limitation.
+
+Memory cycle: no new memory files — all findings are project-specific and captured in code/skeletons.
+
+Closure commit: 74e593be.
