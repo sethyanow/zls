@@ -1440,12 +1440,12 @@ test "resolved_imports cleared on handle re-parse (zls-mxw R-M4)" {
         .textDocument = .{ .uri = a_uri.raw, .version = 2 },
         .contentChanges = &.{
             .{ .text_document_content_change_whole_document = .{ .text =
-                \\const mod_b = @import("mod_b");
-                \\
-                \\pub fn entry(x: u32) u32 {
-                \\    return mod_b.doubled(x) + 0;
-                \\}
-                \\
+            \\const mod_b = @import("mod_b");
+            \\
+            \\pub fn entry(x: u32) u32 {
+            \\    return mod_b.doubled(x) + 0;
+            \\}
+            \\
             } },
         },
     });
