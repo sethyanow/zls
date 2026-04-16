@@ -1,12 +1,16 @@
 ---
 id: zls-pun
 title: 'Phase 2 Acceptance: Call Hierarchy Live Demo'
-status: open
+status: active
 type: task
 priority: 1
-depends_on: [zls-mxw, zls-029]
+owner: Seth
+depends_on: [zls-mxw, zls-029, zls-ez6]
 parent: zls-gyi
 ---
+
+
+
 
 
 
@@ -87,14 +91,18 @@ Live narrated LSP tool walkthrough. The agent runs each step, names the symbol a
 
 ## Sign-Off
 
-- [ ] Demo 1: prepareCallHierarchy on `initAnalyser` returns a correct CallHierarchyItem
-- [ ] Demo 2: incomingCalls on `initAnalyser` returns multiple callers grouped by handler
-- [ ] Demo 3: outgoingCalls on `hoverHandler` returns multiple callees grouped by callee
-- [ ] Demo 4: incomingCalls on `resolveTypeOfNode` spans 4+ feature files
-- [ ] Demo 5: outgoingCalls cross-file confirmed
-- [ ] Demo 6: test declaration returns valid item
-- [ ] Demo 7: non-callable position returns null
-- [ ] Demo 8: incomingCalls on `doubled` in `tests/fixtures/module_imports/` finds the caller in `a.zig` via module-name import (zls-mxw landed)
-- [ ] Demo 9: findReferences on an `@import` string literal finds cross-file importers by resolved URI (zls-029 landed)
-- [ ] CLAUDE.md updated to mention call_hierarchy.zig
+- [x] Demo 1: prepareCallHierarchy on `initAnalyser` returns a correct CallHierarchyItem
+- [x] Demo 2: incomingCalls on `initAnalyser` returns multiple callers grouped by handler
+- [x] Demo 3: outgoingCalls on `hoverHandler` returns multiple callees grouped by callee
+- [x] Demo 4: incomingCalls on `resolveTypeOfNode` spans 4+ feature files
+- [x] Demo 5: outgoingCalls cross-file confirmed
+- [x] Demo 6: test declaration returns valid item
+- [x] Demo 7: non-callable position returns null
+- [ ] Demo 8: incomingCalls on `doubled` in `tests/fixtures/module_imports/` must find BOTH a.zig (module-name) AND c.zig (file-path). Blocked by zls-ez6: build-system path drops loaded handles not in module graph.
+- [x] Demo 9: findReferences on an `@import` string literal finds cross-file importers by resolved URI (zls-029 landed)
+- [x] CLAUDE.md updated to mention call_hierarchy.zig
 - [ ] Phase 2 complete — zls-gyi can close, parent epic zls-xjj final demo criterion satisfied
+
+## Log
+
+- [2026-04-16T06:40:00Z] [Seth] Acceptance demo run: Demos 1-7, 9 pass. Demo 8 FAIL — incomingCalls on doubled found a.zig (module-name, after build runner completes) but lost c.zig (file-path import, not a module root). Root cause: gatherWorkspaceReferenceCandidates build-system path is mutually exclusive with fallback, not unioned. Filed zls-ez6 as blocker.
