@@ -89,3 +89,5 @@
 {"timestamp":"2026-04-16T13:50:01.122524+00:00","actor":"Seth","event_type":"closed","task_id":"zls-pun","details":{"notes":null}}
 {"timestamp":"2026-04-16T13:50:01.181648+00:00","actor":"Seth","event_type":"closed","task_id":"zls-gyi","details":{"notes":null}}
 {"timestamp":"2026-04-16T14:06:01.293494+00:00","actor":"Seth","event_type":"created","task_id":"zls-81s","details":{}}
+{"timestamp":"2026-04-16T14:27:07.525383+00:00","actor":"Seth","event_type":"claimed","task_id":"zls-81s","details":{"actor":"Seth"}}
+{"timestamp":"2026-04-16T14:30:29.548411+00:00","actor":"Seth","event_type":"logged","task_id":"zls-81s","details":{"message":"SRE + adversarial complete. Key finding: sketch had a bug — empty-query path MUST still sort declaration_buffer by token index per-handle for correct advancePosition calculation. Verified test infra works (addWorkspace + addDocument with base_directory populates trigram stores). Adversarial: no new success criteria needed — resource exhaustion is by-design (no cap), sort order is byte-order (matches rust-analyzer)."}}

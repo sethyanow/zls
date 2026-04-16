@@ -1,10 +1,13 @@
 ---
 id: zls-81s
 title: 'workspaceSymbol: return all declarations on empty query'
-status: open
+status: active
 type: bug
 priority: 2
+owner: Seth
 ---
+
+
 
 ## Context
 
@@ -54,7 +57,7 @@ pub fn handler(...) ... {
             for (0..trigram_store.declarations.len) |i| {
                 declaration_buffer.appendAssumeCapacity(@enumFromInt(i));
             }
-            // Skip sort — we'll sort the final result alphabetically
+            // MUST still sort by token index for correct advancePosition calculation
         }
 
         // ... existing symbol-building loop (unchanged) ...
@@ -97,7 +100,29 @@ pub fn handler(...) ... {
 ## Key Considerations
 
 **Test infrastructure: trigram store availability**
-- The test context uses `addDocument` with `untitled://` URIs. The handler calls `server.document_store.loadTrigramStores(workspace_uris)` to get handles — need to verify that trigram stores are populated for documents added this way. If not, tests may need file-backed fixtures (same issue call_hierarchy tests hit). SRE should spot-check `loadTrigramStores` to confirm.
+- SRE VERIFIED: `addWorkspace("Animal Shelter", "/animal_shelter/")` registers workspace URI `untitled:/animal_shelter/`. `addDocument` with `base_directory: "/animal_shelter/"` creates URIs like `untitled:///animal_shelter/Untitled-0.zig`. `loadTrigramStores` filters by `startsWith` on path — this matches. Trigram stores are lazily populated via `handle.trigram_store.get(handle)`. The existing workspace_symbols tests confirm this infra works. No fixture changes needed.
+
+**CRITICAL: Per-file token-index sort is required even on empty-query path**
+- The symbol-building loop (lines 54-66 in current code) uses `advancePosition` with `last_index`/`last_position` to incrementally compute LSP positions. This requires declarations to be processed in monotonically increasing byte offset order within each file. The sketch comment "Skip sort — we'll sort the final result alphabetically" is WRONG for the per-handle loop — skipping the per-file token-index sort produces incorrect LSP positions. CORRECT approach: sort declaration_buffer by token index within each handle (same as existing code), build symbols, THEN sort the final symbols array alphabetically after the handles loop.
+
+**Adversarial Catalog**
+
+**Resource Exhaustion: Declaration enumeration**
+- Assumption: Workspace has a reasonable number of declarations
+- Betrayal: Massive workspace (thousands of files, hundreds of declarations each) — empty query returns ALL of them. No trigram intersection to naturally limit results.
+- Consequence: Large response, high memory use (arena-allocated, freed after handler returns)
+- Mitigation: By design — anti-pattern explicitly forbids a result cap. Arena per-request means no persistent leak. Clients handle large result sets via their own pagination/truncation. Same resource profile as `documentSymbol` on a large file.
+
+**Input Hostility: Alphabetical sort with special characters**
+- Assumption: `std.mem.order(u8, ...)` produces useful sort for symbol names
+- Betrayal: Zig `@"..."` identifiers sort by raw bytes — `@` (0x40) sorts before uppercase letters (0x41+), which sort before lowercase (0x61+). Not locale-aware.
+- Consequence: Grouping is `@`-prefixed → UPPER → lower. Consistent but potentially surprising to clients expecting case-insensitive sort.
+- Mitigation: Acceptable — matches rust-analyzer's behavior (byte-order sort). LSP spec doesn't mandate sort order. Byte-order is deterministic and fast. Case-insensitive sort would be a design decision, not a bug fix.
+
+**Temporal Betrayal: Declaration enumeration vs getCached()**
+- Assumption: `getCached()` returns a fully populated trigram store
+- Betrayal: Could `getCached()` return a store mid-population?
+- Mitigation: `loadTrigramStores` calls `handle.trigram_store.get(handle)` synchronously (with group.await) before returning handles. By the time handler iterates, all stores are fully populated. No race.
 
 ## Implementation
 
@@ -106,3 +131,7 @@ pub fn handler(...) ... {
 3. Modify `handler` in `workspace_symbols.zig`: remove the `if (request.query.len == 0) return null` guard, add the empty-query enumeration path, add alphabetical sort for empty-query results.
 4. Run tests, verify both empty and non-empty queries work.
 5. Run full suite, format check.
+
+## Log
+
+- [2026-04-16T14:30:29Z] [Seth] SRE + adversarial complete. Key finding: sketch had a bug — empty-query path MUST still sort declaration_buffer by token index per-handle for correct advancePosition calculation. Verified test infra works (addWorkspace + addDocument with base_directory populates trigram stores). Adversarial: no new success criteria needed — resource exhaustion is by-design (no cap), sort order is byte-order (matches rust-analyzer).
