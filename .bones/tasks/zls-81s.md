@@ -11,6 +11,7 @@ owner: Seth
 
 
 
+
 ## Context
 
 `workspace/symbol` with an empty query returns `null` in ZLS (`src/features/workspace_symbols.zig:15`). The LSP spec allows servers to return all symbols or a useful subset when the query is empty. rust-analyzer returns up to 128 symbols alphabetically. Other language servers (pyright, typescript-language-server) also return results on empty query.
@@ -138,3 +139,4 @@ pub fn handler(...) ... {
 
 - [2026-04-16T14:30:29Z] [Seth] SRE + adversarial complete. Key finding: sketch had a bug — empty-query path MUST still sort declaration_buffer by token index per-handle for correct advancePosition calculation. Verified test infra works (addWorkspace + addDocument with base_directory populates trigram stores). Adversarial: no new success criteria needed — resource exhaustion is by-design (no cap), sort order is byte-order (matches rust-analyzer).
 - [2026-04-16T14:37:48Z] [Seth] Closed. Implementation: +17 lines in handler (empty-query enumeration + alphabetical sort), +99 lines in tests (4 new test cases: full fixture, empty workspace, single declaration, duplicate names). All 5 success criteria met. SRE caught critical bug in sketch (position calculation requires per-file token-index sort even on empty-query path). Adversarial stress test: 3 patterns tested, all GREEN.
+- [2026-04-16T14:38:34Z] [Seth] Debrief: Clean implementation, no workarounds. SRE caught critical sketch bug (advancePosition requires monotonic byte offsets — per-file sort is mandatory even on empty-query path). Reflections: TrigramStore doesn't index nested declarations in function bodies (Lion2 missing). advancePosition monotonic-offset requirement is a footgun for any handler building LSP positions incrementally.
