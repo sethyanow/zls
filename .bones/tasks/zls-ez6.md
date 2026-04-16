@@ -14,6 +14,7 @@ parent: zls-gyi
 
 
 
+
 ## Context
 
 `gatherWorkspaceReferenceCandidates` (`src/features/references.zig:330`) has two paths:
@@ -110,3 +111,4 @@ return found_uris;
 ## Log
 
 - [2026-04-16T06:40:00Z] [Seth] Filed from acceptance demo. Build-system candidate path (references.zig:338-403) replaces the fallback HandleIterator path instead of unioning with it. Fix: after build-system forward walk, also iterate loaded handles so open files outside the module graph are still searched.
+- [2026-04-16T07:05:09Z] [Seth] Debrief: 5-line fix — HandleIterator union loop after build-system forward walk, isInStd filter added per SRE finding. Regression test + adversarial std-filter test. 675/675 tests green. Reflections: skeleton accurate (design direction matched exactly), SRE added the critical isInStd gap, no user corrections, no surprises. Next: zls-pun unblocked — re-run Demo 8 live.
