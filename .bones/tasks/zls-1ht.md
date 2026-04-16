@@ -1,12 +1,13 @@
 ---
 id: zls-1ht
 title: gatherWorkspaceReferenceCandidates forward walk cannot follow cold resolved_imports edges
-status: active
+status: closed
 type: bug
 priority: 1
 owner: Seth
 parent: zls-gyi
 ---
+
 
 
 
@@ -40,9 +41,9 @@ Verified: the build runner output includes the test file as a module root with c
 
 ## Success Criteria
 
-- [ ] Regression test: `findReferences` on a function in a source module finds callers in test files that import the module by name, without the test file's `resolved_imports` needing to be warmed first
-- [ ] Existing references.zig and call_hierarchy.zig tests pass (`zig build test --summary all`)
-- [ ] The fix snapshots `BuildConfig.modules.map` import_table data during the seed phase and uses it during the forward walk — no new eager-warming mechanism, no per-handle config re-locking
+- [x] Regression test: `findReferences` on a function in a source module finds callers in test files that import the module by name, without the test file's `resolved_imports` needing to be warmed first
+- [x] Existing references.zig and call_hierarchy.zig tests pass (`zig build test --summary all`)
+- [x] The fix snapshots `BuildConfig.modules.map` import_table data during the seed phase and uses it during the forward walk — no new eager-warming mechanism, no per-handle config re-locking
 
 ## Anti-Patterns
 

@@ -83,3 +83,4 @@
 {"timestamp":"2026-04-16T08:34:17.337440+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-1ht"}}
 {"timestamp":"2026-04-16T12:29:09.293613+00:00","actor":"Seth","event_type":"claimed","task_id":"zls-1ht","details":{"actor":"Seth"}}
 {"timestamp":"2026-04-16T12:29:09.354598+00:00","actor":"Seth","event_type":"updated","task_id":"zls-1ht","details":{"status":"active"}}
+{"timestamp":"2026-04-16T12:40:37.099990+00:00","actor":"Seth","event_type":"closed","task_id":"zls-1ht","details":{"notes":null}}
