@@ -40,10 +40,10 @@ R10. All new functionality shall have LSP feature tests in `tests/lsp_features/c
 - [x] `textDocument/prepareCallHierarchy` returns correct items for functions, tests, and comptime blocks
 - [x] `callHierarchy/incomingCalls` returns callers across multiple files with correct grouping and ranges
 - [x] `callHierarchy/outgoingCalls` returns callees across multiple files with correct grouping and ranges
-- [ ] `findReferences` cross-file coverage improved (validated by LSP tool demo on real codebase)
+- [x] `findReferences` cross-file coverage improved (validated by LSP tool demo on real codebase)
 - [x] `zig build test --summary all` passes with new tests
 - [x] `zig fmt --check .` passes
-- [ ] Live narrated LSP tool demo showing call hierarchy on real ZLS functions with cross-file results
+- [x] Live narrated LSP tool demo showing call hierarchy on real ZLS functions with cross-file results
 
 ## Anti-Patterns (FORBIDDEN)
 - NO single-file-only call hierarchy results (the whole point is cross-file — if we only find callers in the current file, we've failed. The existing `callsiteReferences` already does single-file.)

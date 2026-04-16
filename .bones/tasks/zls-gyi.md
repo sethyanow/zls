@@ -1,12 +1,13 @@
 ---
 id: zls-gyi
 title: 'Phase 2: Call Hierarchy Implementation'
-status: open
+status: closed
 type: epic
 priority: 1
 depends_on: [zls-h4v, zls-6pm, zls-t17, zls-239, zls-a9k, zls-pun, zls-mxw, zls-029, zls-ez6, zls-1ht]
 parent: zls-xjj
 ---
+
 
 
 
@@ -53,7 +54,7 @@ The implementation extends the existing `references.zig` Builder (Approach C) to
 - [x] `zig build test --summary all` passes (including new call_hierarchy tests)
 - [x] `zig build test -Dtest-filter="call_hierarchy"` passes specifically
 - [x] `zig fmt --check .` passes
-- [ ] Live narrated LSP tool demo showing all three operations on real ZLS functions
+- [x] Live narrated LSP tool demo showing all three operations on real ZLS functions
 
 ## Anti-Patterns
 - NO separate CallBuilder codepath (R8 mandates extending existing Builder, not duplicating)
