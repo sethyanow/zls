@@ -14,6 +14,7 @@ parent: zls-gyi
 
 
 
+
 ## Context
 
 `gatherWorkspaceReferenceCandidates` (`src/features/references.zig:330`) seeds its forward walk from ALL module roots in the resolved `BuildConfig`, then walks forward via `file_imports` (line 381) and `resolved_imports` (line 389-401). This correctly discovers files connected by both file-path and module-name imports — **but only if `resolved_imports` has been populated**.
@@ -164,3 +165,4 @@ if (import_table_snapshot.get(uri)) |import_uris| {
 ## Log
 
 - [2026-04-16T08:30:00Z] [Seth] Found during live testing against a real Zig codebase using exclusively module-name imports. Build runner output confirmed correct (test modules with full import_table). Forward walk from test file module roots follows zero edges because resolved_imports is cold. The data to fix this already exists in BuildConfig.modules.map.
+- [2026-04-16T12:41:16Z] [Seth] Debrief: import_table snapshot fix. 32 lines production code, regression test + adversarial std-filter test. SRE caught two issues in original sketch: count()==0 guard unreliable due to partial warmth, per-handle re-locking wasteful/racy. Fixed by unconditional snapshotting during seed phase. Reflections: skeleton design direction correct but details wrong — SRE value confirmed. Fix matters specifically for non-module-root files reachable via module-name import from module roots. 677/677 tests green.
