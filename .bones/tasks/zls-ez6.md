@@ -1,12 +1,13 @@
 ---
 id: zls-ez6
 title: gatherWorkspaceReferenceCandidates build-system path drops loaded handles not in module graph
-status: active
+status: closed
 type: bug
 priority: 1
 owner: Seth
 parent: zls-gyi
 ---
+
 
 
 
@@ -43,9 +44,9 @@ Result: having a build config produces FEWER results than not having one. The bu
 
 ## Success Criteria
 
-- [ ] `incomingCalls` on `doubled` in `b.zig` returns BOTH `a.zig:entry` (module-name import) and `c.zig:wrap` (file-path import) when the build config is resolved
-- [ ] Existing references.zig and call_hierarchy.zig tests pass (`zig build test --summary all`)
-- [ ] Union loop filters std URIs via `DocumentStore.isInStd` — consistent with the build-system forward walk's std filtering
+- [x] `incomingCalls` on `doubled` in `b.zig` returns BOTH `a.zig:entry` (module-name import) and `c.zig:wrap` (file-path import) when the build config is resolved
+- [x] Existing references.zig and call_hierarchy.zig tests pass (`zig build test --summary all`)
+- [x] Union loop filters std URIs via `DocumentStore.isInStd` — consistent with the build-system forward walk's std filtering
 
 ## Anti-Patterns
 
