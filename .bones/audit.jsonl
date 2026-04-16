@@ -77,3 +77,7 @@
 {"timestamp":"2026-04-16T06:52:55.865945+00:00","actor":"Seth","event_type":"claimed","task_id":"zls-ez6","details":{"actor":"Seth"}}
 {"timestamp":"2026-04-16T07:04:07.279890+00:00","actor":"Seth","event_type":"closed","task_id":"zls-ez6","details":{"notes":null}}
 {"timestamp":"2026-04-16T07:05:09.894741+00:00","actor":"Seth","event_type":"logged","task_id":"zls-ez6","details":{"message":"Debrief: 5-line fix — HandleIterator union loop after build-system forward walk, isInStd filter added per SRE finding. Regression test + adversarial std-filter test. 675/675 tests green. Reflections: skeleton accurate (design direction matched exactly), SRE added the critical isInStd gap, no user corrections, no surprises. Next: zls-pun unblocked — re-run Demo 8 live."}}
+{"timestamp":"2026-04-16T08:33:33.448247+00:00","actor":"Seth","event_type":"created","task_id":"zls-1ht","details":{}}
+{"timestamp":"2026-04-16T08:34:17.281023+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-pun","details":{"kind":"blocks","to":"zls-1ht"}}
+{"timestamp":"2026-04-16T08:34:17.337024+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"parent-child","to":"zls-1ht"}}
+{"timestamp":"2026-04-16T08:34:17.337440+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-1ht"}}
