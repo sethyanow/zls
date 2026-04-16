@@ -1,11 +1,13 @@
 ---
 id: zls-81s
 title: 'workspaceSymbol: return all declarations on empty query'
-status: active
+status: closed
 type: bug
 priority: 2
 owner: Seth
 ---
+
+
 
 
 
@@ -85,11 +87,11 @@ pub fn handler(...) ... {
 
 ## Success Criteria
 
-- [ ] `workspace/symbol` with empty query returns all indexed declarations sorted alphabetically
-- [ ] `workspace/symbol` with non-empty query continues to use trigram matching (no regression)
-- [ ] Existing workspace_symbols tests pass
-- [ ] `zig build test --summary all` passes
-- [ ] `zig fmt --check .` passes
+- [x] `workspace/symbol` with empty query returns all indexed declarations sorted alphabetically
+- [x] `workspace/symbol` with non-empty query continues to use trigram matching (no regression)
+- [x] Existing workspace_symbols tests pass
+- [x] `zig build test --summary all` passes
+- [x] `zig fmt --check .` passes
 
 ## Anti-Patterns
 
@@ -135,3 +137,4 @@ pub fn handler(...) ... {
 ## Log
 
 - [2026-04-16T14:30:29Z] [Seth] SRE + adversarial complete. Key finding: sketch had a bug — empty-query path MUST still sort declaration_buffer by token index per-handle for correct advancePosition calculation. Verified test infra works (addWorkspace + addDocument with base_directory populates trigram stores). Adversarial: no new success criteria needed — resource exhaustion is by-design (no cap), sort order is byte-order (matches rust-analyzer).
+- [2026-04-16T14:37:48Z] [Seth] Closed. Implementation: +17 lines in handler (empty-query enumeration + alphabetical sort), +99 lines in tests (4 new test cases: full fixture, empty workspace, single declaration, duplicate names). All 5 success criteria met. SRE caught critical bug in sketch (position calculation requires per-file token-index sort even on empty-query path). Adversarial stress test: 3 patterns tested, all GREEN.
