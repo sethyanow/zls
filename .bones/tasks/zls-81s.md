@@ -94,6 +94,11 @@ pub fn handler(...) ... {
 - DO NOT change the trigram-query path — the fix is additive (empty-query branch), not a rewrite.
 - DO NOT sort the trigram-query results alphabetically — relevance-ranked results from trigram matching should stay in their existing order (by token index within each file).
 
+## Key Considerations
+
+**Test infrastructure: trigram store availability**
+- The test context uses `addDocument` with `untitled://` URIs. The handler calls `server.document_store.loadTrigramStores(workspace_uris)` to get handles — need to verify that trigram stores are populated for documents added this way. If not, tests may need file-backed fixtures (same issue call_hierarchy tests hit). SRE should spot-check `loadTrigramStores` to confirm.
+
 ## Implementation
 
 1. Write a regression test: send `workspace/symbol` with empty query, assert non-null result with declarations from the test document.
