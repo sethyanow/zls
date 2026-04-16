@@ -2439,3 +2439,280 @@ test "adversarial: findReferences on self-importing file (zls-029)" {
         try std.testing.expect(std.mem.eql(u8, locs[0].uri, uri.raw));
     }
 }
+
+test "findReferences on definition includes non-module-root loaded handles, build-system path (zls-ez6)" {
+    // Regression: gatherWorkspaceReferenceCandidates build-system path
+    // (references.zig:338-403) returns found_uris BEFORE reaching the
+    // fallback HandleIterator path. Files loaded in the DocumentStore but
+    // NOT reachable from any module root in the BuildConfig are silently
+    // dropped from the candidate set. Result: having a build config
+    // produces FEWER results than not having one.
+    //
+    // Fixture: a.zig (module root, @import("mod_b")), b.zig (module root,
+    // defines doubled()), c.zig (NOT a module root, @import("b.zig"),
+    // calls doubled()). Config has two modules: mod_a and mod_b. c.zig is
+    // loaded but has no associated build file.
+    //
+    // Cursor on `doubled` in b.zig (the definition). Without the fix, the
+    // build-system forward walk seeds from mod_a and mod_b roots, finds
+    // a.zig via resolved_imports, but never discovers c.zig because c.zig
+    // is not a module root and not reachable from any module root's
+    // file_imports or resolved_imports.
+    //
+    // Fix: after the build-system forward walk, union loaded handles via
+    // HandleIterator so files open in the editor but not in the module
+    // graph are still searched.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const c_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/c.zig" });
+    defer allocator.free(c_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+    const c_uri: zls.Uri = try .fromPath(allocator, c_path);
+    defer c_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open all three files. c.zig imports b.zig by file path, so eager
+    // loading may pull b.zig in — but the key is that c.zig itself is
+    // loaded in the store without being a module root.
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = b_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/b.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = c_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/c.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+    const b_handle = ctx.server.document_store.getHandle(b_uri) orelse return error.BHandleMissing;
+    // c_handle is NOT stamped as resolved — no associated build file.
+
+    // Two-module config: mod_a and mod_b only. c.zig is deliberately
+    // excluded — it's loaded but not a module root.
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    // Stamp only a and b — c stays at .init/.none.
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+    try helper_build.stampResolved(&ctx.server.document_store, b_handle, fb.build_file, b_path);
+
+    // Warm a_handle's resolved_imports cache so the forward walk follows
+    // the mod_b edge from a.zig to b.zig.
+    const resolve_result = try ctx.server.document_store.uriFromImportStr(
+        ctx.arena.allocator(),
+        a_handle,
+        "mod_b",
+    );
+    switch (resolve_result) {
+        .one => {},
+        else => return error.ModBDidNotResolve,
+    }
+
+    // Cursor on `doubled` in b.zig (the definition).
+    const b_source = @embedFile("../fixtures/module_imports/b.zig");
+    const doubled_pos = offsets.indexToPosition(
+        b_source,
+        std.mem.indexOf(u8, b_source, "doubled").?,
+        ctx.server.offset_encoding,
+    );
+
+    const response = try ctx.server.sendRequestSync(
+        ctx.arena.allocator(),
+        "textDocument/references",
+        types.reference.Params{
+            .textDocument = .{ .uri = b_uri.raw },
+            .position = doubled_pos,
+            .context = .{ .includeDeclaration = true },
+        },
+    );
+
+    const locations: []const types.Location = response orelse {
+        std.debug.print("zls-ez6: server returned null for findReferences\n", .{});
+        return error.InvalidResponse;
+    };
+
+    // Must find callers in BOTH a.zig (module-name import, discovered by
+    // build-system forward walk) AND c.zig (file-path import, loaded but
+    // not a module root — discovered only if the union loop runs).
+    var found_a = false;
+    var found_c = false;
+    for (locations) |loc| {
+        if (std.mem.eql(u8, loc.uri, a_uri.raw)) found_a = true;
+        if (std.mem.eql(u8, loc.uri, c_uri.raw)) found_c = true;
+    }
+    try std.testing.expect(found_a);
+    try std.testing.expect(found_c);
+}
+
+test "gatherWorkspaceReferenceCandidates build-system union loop filters std URIs (zls-ez6)" {
+    // Adversarial: the HandleIterator union loop added in zls-ez6 must
+    // filter std URIs via isInStd, matching the build-system forward walk's
+    // filter (line 399). Without the filter, a loaded std handle leaks
+    // into the candidate set and balloons the reference search.
+    //
+    // The existing R-M7 test guards the fallback path's std filter.
+    // This test guards the build-system path's union loop.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = b_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/b.zig"),
+        },
+    });
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+    const b_handle = ctx.server.document_store.getHandle(b_uri) orelse return error.BHandleMissing;
+
+    // Stamp as resolved so the build-system path runs (not the fallback).
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }},
+        \\    "{s}": {{
+        \\      "import_table": {{}},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+    try helper_build.stampResolved(&ctx.server.document_store, b_handle, fb.build_file, b_path);
+
+    // Inject a synthetic std URI into a_handle.resolved_imports — same
+    // technique as the R-M7 test, but now with a resolved build config
+    // so the build-system path (including the union loop) runs.
+    const store = &ctx.server.document_store;
+    const fake_std_uri: zls.Uri = try .fromPath(allocator, "/tmp/zls-test-nonexistent/lib/std/std.zig");
+    defer fake_std_uri.deinit(allocator);
+    try std.testing.expect(zls.DocumentStore.isInStd(fake_std_uri));
+
+    const duped = try fake_std_uri.dupe(store.allocator);
+    {
+        a_handle.impl.lock.lockUncancelable(store.io);
+        defer a_handle.impl.lock.unlock(store.io);
+        const gop = try a_handle.resolved_imports.getOrPut(store.allocator, duped);
+        if (gop.found_existing) duped.deinit(store.allocator);
+    }
+
+    // Call gatherWorkspaceReferenceCandidates directly — build-system
+    // path runs because a_handle has a resolved build file.
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var candidates = try zls.references.gatherWorkspaceReferenceCandidates(
+        store,
+        arena,
+        a_handle,
+        a_handle,
+    );
+
+    for (candidates.keys()) |uri| {
+        if (zls.DocumentStore.isInStd(uri)) {
+            std.debug.print("regression: build-system union loop leaked std URI: {s}\n", .{uri.raw});
+            return error.StdUriLeakedIntoCandidateSet;
+        }
+    }
+}

@@ -400,6 +400,18 @@ pub fn gatherWorkspaceReferenceCandidates(
                 found_uris.putAssumeCapacity(resolved_uri, {});
             }
         }
+
+        // Union with loaded handles so files open in the editor but not
+        // in the module graph are still searched (zls-ez6). Without this,
+        // the build-system path is mutually exclusive with the fallback
+        // HandleIterator path, and loaded files that aren't module roots
+        // are silently dropped from the candidate set.
+        var it: DocumentStore.HandleIterator = .{ .store = store };
+        while (it.next()) |handle| {
+            if (DocumentStore.isInStd(handle.uri)) continue;
+            try found_uris.put(arena, handle.uri, {});
+        }
+
         return found_uris;
     }
 
