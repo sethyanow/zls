@@ -81,3 +81,5 @@
 {"timestamp":"2026-04-16T08:34:17.281023+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-pun","details":{"kind":"blocks","to":"zls-1ht"}}
 {"timestamp":"2026-04-16T08:34:17.337024+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"parent-child","to":"zls-1ht"}}
 {"timestamp":"2026-04-16T08:34:17.337440+00:00","actor":"Seth","event_type":"dep_added","task_id":"zls-gyi","details":{"kind":"blocks","to":"zls-1ht"}}
+{"timestamp":"2026-04-16T12:29:09.293613+00:00","actor":"Seth","event_type":"claimed","task_id":"zls-1ht","details":{"actor":"Seth"}}
+{"timestamp":"2026-04-16T12:29:09.354598+00:00","actor":"Seth","event_type":"updated","task_id":"zls-1ht","details":{"status":"active"}}

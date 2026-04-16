@@ -360,15 +360,35 @@ pub fn gatherWorkspaceReferenceCandidates(
         // fall through to the fallback path — same safety semantics as the
         // `.unresolved` branch above.
         var found_uris: Uri.ArrayHashMap(void) = .empty;
+        // Snapshot: for each module root, pre-convert its import_table
+        // values to URIs while the config is locked. The forward walk
+        // adds these alongside resolved_imports — covering module-name
+        // imports for handles whose resolved_imports haven't been warmed
+        // by analysis yet (zls-1ht).
+        var import_table_snapshot: Uri.ArrayHashMap([]Uri) = .empty;
         {
             const build_config = resolved.build_file.tryLockConfig(store.io) orelse break :no_build_file;
             defer resolved.build_file.unlockConfig(store.io);
 
             const module_paths = build_config.modules.map.keys();
+            const module_values = build_config.modules.map.values();
             try found_uris.ensureUnusedCapacity(arena, module_paths.len);
-            for (module_paths) |module_path| {
+            try import_table_snapshot.ensureTotalCapacity(arena, module_paths.len);
+
+            for (module_paths, module_values) |module_path, module| {
                 const module_uri: Uri = try .fromPath(arena, module_path);
                 found_uris.putAssumeCapacity(module_uri, {});
+
+                const import_values = module.import_table.map.values();
+                const import_uris = try arena.alloc(Uri, import_values.len);
+                var count: usize = 0;
+                for (import_values) |import_path| {
+                    const import_uri: Uri = try .fromPath(arena, import_path);
+                    if (DocumentStore.isInStd(import_uri)) continue;
+                    import_uris[count] = import_uri;
+                    count += 1;
+                }
+                import_table_snapshot.putAssumeCapacity(module_uri, import_uris[0..count]);
             }
         }
 
@@ -398,6 +418,17 @@ pub fn gatherWorkspaceReferenceCandidates(
             for (resolved_snapshot) |resolved_uri| {
                 if (DocumentStore.isInStd(resolved_uri)) continue;
                 found_uris.putAssumeCapacity(resolved_uri, {});
+            }
+
+            // Add import_table edges from the BuildConfig snapshot (zls-1ht).
+            // This covers module-name imports for files whose resolved_imports
+            // haven't been warmed by analysis yet. The snapshot was built
+            // during the seed phase while the config was locked.
+            if (import_table_snapshot.get(uri)) |import_uris| {
+                try found_uris.ensureUnusedCapacity(arena, import_uris.len);
+                for (import_uris) |import_uri| {
+                    found_uris.putAssumeCapacity(import_uri, {});
+                }
             }
         }
 

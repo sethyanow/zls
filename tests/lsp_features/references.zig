@@ -2716,3 +2716,207 @@ test "gatherWorkspaceReferenceCandidates build-system union loop filters std URI
         }
     }
 }
+
+test "gatherWorkspaceReferenceCandidates discovers import_table targets with cold resolved_imports (zls-1ht)" {
+    // Regression: the build-system forward walk follows resolved_imports
+    // (lazy cache populated by uriFromImportStr during analysis) to discover
+    // files connected by module-name imports. But resolved_imports is empty
+    // for handles that have never been analyzed — e.g. test files the user
+    // hasn't opened. The forward walk follows zero edges, even though the
+    // BuildConfig's import_table has the exact mapping.
+    //
+    // Fix: snapshot import_table values during the seed phase (while the
+    // config is locked) and add them during the forward walk.
+    //
+    // Setup: a.zig is the ONLY module root, with import_table {"mod_b": b_path}.
+    // b.zig is NOT a module root — only reachable via a's import_table.
+    // b.zig is NOT opened (not loaded in the store).
+    // a_handle.resolved_imports is NOT warmed (no uriFromImportStr call).
+    //
+    // Without fix: found_uris = {a_uri} — b.zig never discovered.
+    // With fix: found_uris includes b_uri — imported via snapshot.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const b_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/b.zig" });
+    defer allocator.free(b_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+    const b_uri: zls.Uri = try .fromPath(allocator, b_path);
+    defer b_uri.deinit(allocator);
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    // Open ONLY a.zig. b.zig is NOT opened — not loaded in the store.
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+
+    // One-module config: ONLY a.zig is a module root.
+    // import_table maps "mod_b" → b_path.
+    // b.zig is NOT a module root — only reachable via import_table.
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "mod_b": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, b_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    // Stamp only a.zig — b.zig has no build file association.
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+
+    // Adversarial guard: resolved_imports must be cold.
+    // If anything above accidentally warmed it, this test would pass
+    // vacuously without exercising the import_table fallback.
+    {
+        a_handle.impl.lock.lockUncancelable(ctx.server.document_store.io);
+        defer a_handle.impl.lock.unlock(ctx.server.document_store.io);
+        try std.testing.expectEqual(@as(usize, 0), a_handle.resolved_imports.count());
+    }
+
+    // Call gatherWorkspaceReferenceCandidates directly.
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const candidates = try zls.references.gatherWorkspaceReferenceCandidates(
+        &ctx.server.document_store,
+        arena,
+        a_handle,
+        a_handle,
+    );
+
+    // b_uri must be in the candidate set — discovered via import_table
+    // snapshot, not via resolved_imports or file_imports.
+    var found_b = false;
+    for (candidates.keys()) |uri| {
+        if (uri.eql(b_uri)) found_b = true;
+    }
+    if (!found_b) {
+        std.debug.print("zls-1ht: b_uri not in candidate set. Candidates ({d}):\n", .{candidates.count()});
+        for (candidates.keys()) |uri| {
+            std.debug.print("  {s}\n", .{uri.raw});
+        }
+        return error.ImportTableTargetNotDiscovered;
+    }
+}
+
+test "import_table snapshot filters std URIs (zls-1ht)" {
+    // Adversarial: the import_table snapshot has its own isInStd filter
+    // in the seed phase. The existing zls-ez6 adversarial test guards the
+    // HandleIterator union loop and resolved_imports filters, but NOT
+    // the import_table snapshot's filter. If only the snapshot's filter
+    // broke, std URIs would leak into found_uris via a path no other
+    // test covers.
+    //
+    // Setup: a.zig is a module root whose import_table has ONE entry
+    // pointing to a std path. The snapshot must filter it out. No std
+    // URI should appear in the candidate set.
+
+    const io = std.testing.io;
+
+    const cwd = try std.process.currentPathAlloc(io, allocator);
+    defer allocator.free(cwd);
+
+    const a_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/a.zig" });
+    defer allocator.free(a_path);
+    const build_zig_path = try std.Io.Dir.path.resolve(allocator, &.{ cwd, "tests/fixtures/module_imports/build.zig" });
+    defer allocator.free(build_zig_path);
+
+    const a_uri: zls.Uri = try .fromPath(allocator, a_path);
+    defer a_uri.deinit(allocator);
+
+    // A path that isInStd recognizes as std.
+    const std_path = "/tmp/zls-test-nonexistent/lib/std/math.zig";
+    const std_uri: zls.Uri = try .fromPath(allocator, std_path);
+    defer std_uri.deinit(allocator);
+    try std.testing.expect(zls.DocumentStore.isInStd(std_uri));
+
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    _ = try ctx.server.sendNotificationSync(ctx.arena.allocator(), "textDocument/didOpen", .{
+        .textDocument = .{
+            .uri = a_uri.raw,
+            .languageId = .{ .custom_value = "zig" },
+            .version = 1,
+            .text = @embedFile("../fixtures/module_imports/a.zig"),
+        },
+    });
+
+    const a_handle = ctx.server.document_store.getHandle(a_uri) orelse return error.AHandleMissing;
+
+    // Config: a.zig's import_table points to a std path.
+    const config_json = try std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "dependencies": {{}},
+        \\  "modules": {{
+        \\    "{s}": {{
+        \\      "import_table": {{
+        \\        "std_math": "{s}"
+        \\      }},
+        \\      "c_macros": [],
+        \\      "include_dirs": []
+        \\    }}
+        \\  }},
+        \\  "compilations": [],
+        \\  "top_level_steps": [],
+        \\  "available_options": {{}}
+        \\}}
+    , .{ a_path, std_path });
+    defer allocator.free(config_json);
+
+    var fb = try helper_build.makeResolved(allocator, build_zig_path, config_json);
+    defer fb.deinit();
+
+    try helper_build.stampResolved(&ctx.server.document_store, a_handle, fb.build_file, a_path);
+
+    var arena_state: std.heap.ArenaAllocator = .init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const candidates = try zls.references.gatherWorkspaceReferenceCandidates(
+        &ctx.server.document_store,
+        arena,
+        a_handle,
+        a_handle,
+    );
+
+    for (candidates.keys()) |uri| {
+        if (zls.DocumentStore.isInStd(uri)) {
+            std.debug.print("zls-1ht adversarial: import_table snapshot leaked std URI: {s}\n", .{uri.raw});
+            return error.StdUriLeakedFromImportTableSnapshot;
+        }
+    }
+}
