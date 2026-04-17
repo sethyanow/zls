@@ -1,11 +1,12 @@
 ---
 id: zls-xjj
 title: Call Hierarchy + Cross-File Reference Coverage for ZLS
-status: open
+status: closed
 type: epic
 priority: 1
 depends_on: [zls-h4v, zls-gyi, zls-6pm]
 ---
+
 
 
 
