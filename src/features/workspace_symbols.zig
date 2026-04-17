@@ -12,8 +12,6 @@ const TrigramStore = @import("../TrigramStore.zig");
 const Uri = @import("../Uri.zig");
 
 pub fn handler(server: *Server, arena: std.mem.Allocator, request: types.workspace.Symbol.Params) error{ OutOfMemory, Canceled }!?types.workspace.Symbol.Result {
-    if (request.query.len == 0) return null;
-
     var workspace_uris: std.ArrayList(std.Uri) = try .initCapacity(arena, server.workspaces.items.len);
     defer workspace_uris.deinit(arena);
 
@@ -31,7 +29,15 @@ pub fn handler(server: *Server, arena: std.mem.Allocator, request: types.workspa
         const trigram_store = handle.trigram_store.getCached();
 
         declaration_buffer.clearRetainingCapacity();
-        try trigram_store.declarationsForQuery(arena, request.query, &declaration_buffer);
+
+        if (request.query.len > 0) {
+            try trigram_store.declarationsForQuery(arena, request.query, &declaration_buffer);
+        } else {
+            try declaration_buffer.ensureUnusedCapacity(arena, trigram_store.declarations.len);
+            for (0..trigram_store.declarations.len) |i| {
+                declaration_buffer.appendAssumeCapacity(@enumFromInt(i));
+            }
+        }
 
         const SortContext = struct {
             names: []const std.zig.Ast.TokenIndex,
@@ -87,6 +93,14 @@ pub fn handler(server: *Server, arena: std.mem.Allocator, request: types.workspa
                 },
             });
         }
+    }
+
+    if (request.query.len == 0) {
+        std.mem.sortUnstable(types.workspace.Symbol, symbols.items, {}, struct {
+            fn lessThan(_: void, a: types.workspace.Symbol, b: types.workspace.Symbol) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lessThan);
     }
 
     return .{ .workspace_symbols = symbols.items };

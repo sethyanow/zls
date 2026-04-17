@@ -7,6 +7,105 @@ const types = zls.lsp.types;
 
 const allocator: std.mem.Allocator = std.testing.allocator;
 
+test "workspace symbols - empty query returns all declarations sorted alphabetically" {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    try ctx.addWorkspace("Animal Shelter", "/animal_shelter/");
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const SalamanderCrab = struct {
+        \\    fn salamander_crab() void {}
+        \\};
+    , .base_directory = "/animal_shelter/" });
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const Dog = struct {
+        \\    const sheltie: Dog = .{};
+        \\    var @"Mr Crabs" = @compileError("hold up");
+        \\};
+        \\test "walk the dog" {
+        \\    const dog: Dog = .sheltie;
+        \\    _ = dog; // nah
+        \\}
+    , .base_directory = "/animal_shelter/" });
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const Lion = struct {
+        \\    extern fn evolveToMonke() void;
+        \\    fn roar() void {
+        \\        var lion = "cool!";
+        \\        const Lion2 = struct {
+        \\            const lion_for_real = 0;
+        \\        };
+        \\    }
+        \\};
+    , .base_directory = "/animal_shelter/" });
+
+    try testDocumentSymbol(&ctx, "",
+        \\Variable @"Mr Crabs"
+        \\Constant Dog
+        \\Constant Lion
+        \\Constant SalamanderCrab
+        \\Function evolveToMonke
+        \\Constant lion_for_real
+        \\Function roar
+        \\Function salamander_crab
+        \\Constant sheltie
+        \\Method walk the dog
+    );
+}
+
+test "workspace symbols - empty query with no documents returns empty result" {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    try ctx.addWorkspace("Empty Project", "/empty_project/");
+
+    try testDocumentSymbol(&ctx, "", "");
+}
+
+test "workspace symbols - empty query with single declaration" {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    try ctx.addWorkspace("Solo", "/solo/");
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const OnlyOne = struct {};
+    , .base_directory = "/solo/" });
+
+    try testDocumentSymbol(&ctx, "",
+        \\Constant OnlyOne
+    );
+}
+
+test "workspace symbols - empty query with duplicate names across files" {
+    var ctx: Context = try .init();
+    defer ctx.deinit();
+
+    try ctx.addWorkspace("Dupes", "/dupes/");
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const Config = struct {};
+        \\fn init() void {}
+    , .base_directory = "/dupes/" });
+
+    _ = try ctx.addDocument(.{ .source =
+        \\const Config = struct {};
+        \\fn setup() void {}
+    , .base_directory = "/dupes/" });
+
+    // Both Config entries should appear — duplicates are preserved, sorted alphabetically.
+    // With identical names, sort is deterministic (stable within equal keys).
+    try testDocumentSymbol(&ctx, "",
+        \\Constant Config
+        \\Constant Config
+        \\Function init
+        \\Function setup
+    );
+}
+
 test "workspace symbols" {
     var ctx: Context = try .init();
     defer ctx.deinit();

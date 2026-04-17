@@ -5,6 +5,7 @@ const Ast = std.zig.Ast;
 
 const Server = @import("../Server.zig");
 const DocumentStore = @import("../DocumentStore.zig");
+const DocumentScope = @import("../DocumentScope.zig");
 const Analyser = @import("../analysis.zig");
 const lsp = @import("lsp");
 const types = lsp.types;
@@ -324,7 +325,9 @@ fn symbolReferences(
     return builder.locations;
 }
 
-fn gatherWorkspaceReferenceCandidates(
+// Exposed as `pub` for direct test access (zls-mxw R-M7 std-pollution regression).
+// Non-logic change — purely a visibility bump. No behavioural change.
+pub fn gatherWorkspaceReferenceCandidates(
     store: *DocumentStore,
     arena: std.mem.Allocator,
     /// The file on which the request was initiated.
@@ -334,24 +337,58 @@ fn gatherWorkspaceReferenceCandidates(
 ) Analyser.Error!Uri.ArrayHashMap(void) {
     if (DocumentStore.supports_build_system) no_build_file: {
         const resolved = switch (try root_handle.getAssociatedBuildFile(store)) {
-            .unresolved => return .empty, // this should await instead
-            .none => break :no_build_file,
+            // .unresolved means the build runner hasn't populated config yet.
+            // No refresh signal is sent to the client for references, so we
+            // can't rely on a retry. Fall through to the fallback path
+            // (Phase 1's eager-loaded handles) instead of returning empty —
+            // too many results is recoverable, an empty set is not.
+            // Long-term fix: await the build config via an Event on BuildFile.
+            .unresolved, .none => break :no_build_file,
             .resolved => |resolved| resolved,
         };
 
-        const root_module_root_uri: Uri = try .fromPath(arena, resolved.root_source_file);
-
+        // R-M6: seed the forward walk from ALL module roots in the resolved
+        // BuildConfig, not just root_handle's module root. The earlier narrow
+        // seed (root + optional target module root) couldn't reach reverse
+        // callers in other modules when cursor was on a definition
+        // (root == target): forward walk from one module root never crosses
+        // back out to its importers. Seeding every module root makes each
+        // module's importers directly walkable.
+        //
+        // Mirrors the pattern at `DocumentStore.BuildFile.isAssociatedWith`
+        // (src/DocumentStore.zig:95-152). If `tryLockConfig` can't acquire,
+        // fall through to the fallback path — same safety semantics as the
+        // `.unresolved` branch above.
         var found_uris: Uri.ArrayHashMap(void) = .empty;
-        try found_uris.put(arena, root_module_root_uri, {});
+        // Snapshot: for each module root, pre-convert its import_table
+        // values to URIs while the config is locked. The forward walk
+        // adds these alongside resolved_imports — covering module-name
+        // imports for handles whose resolved_imports haven't been warmed
+        // by analysis yet (zls-1ht).
+        var import_table_snapshot: Uri.ArrayHashMap([]Uri) = .empty;
+        {
+            const build_config = resolved.build_file.tryLockConfig(store.io) orelse break :no_build_file;
+            defer resolved.build_file.unlockConfig(store.io);
 
-        if (!root_handle.uri.eql(target_handle.uri)) {
-            switch (try target_handle.getAssociatedBuildFile(store)) {
-                .unresolved, .none => {},
-                .resolved => |resolved2| {
-                    const target_module_root_uri: Uri = try .fromPath(arena, resolved2.root_source_file);
-                    // also search through the module in which the symbol has been defined
-                    try found_uris.put(arena, target_module_root_uri, {});
-                },
+            const module_paths = build_config.modules.map.keys();
+            const module_values = build_config.modules.map.values();
+            try found_uris.ensureUnusedCapacity(arena, module_paths.len);
+            try import_table_snapshot.ensureTotalCapacity(arena, module_paths.len);
+
+            for (module_paths, module_values) |module_path, module| {
+                const module_uri: Uri = try .fromPath(arena, module_path);
+                found_uris.putAssumeCapacity(module_uri, {});
+
+                const import_values = module.import_table.map.values();
+                const import_uris = try arena.alloc(Uri, import_values.len);
+                var count: usize = 0;
+                for (import_values) |import_path| {
+                    const import_uri: Uri = try .fromPath(arena, import_path);
+                    if (DocumentStore.isInStd(import_uri)) continue;
+                    import_uris[count] = import_uri;
+                    count += 1;
+                }
+                import_table_snapshot.putAssumeCapacity(module_uri, import_uris[0..count]);
             }
         }
 
@@ -362,7 +399,50 @@ fn gatherWorkspaceReferenceCandidates(
 
             try found_uris.ensureUnusedCapacity(arena, handle.file_imports.len);
             for (handle.file_imports) |import_uri| found_uris.putAssumeCapacity(import_uri, {});
+
+            // Union `resolved_imports` (module-name imports, std/builtin/root,
+            // build deps) alongside `file_imports`. Skip std — every file
+            // imports std, walking that edge would balloon the candidate set
+            // on reverse search for any user-code symbol. Snapshot under
+            // `impl.lock` so a concurrent `uriFromImportStr` insert (or
+            // `Handle.refresh` swap) can't free the URIs mid-walk.
+            const resolved_snapshot: []Uri = snap: {
+                handle.impl.lock.lockUncancelable(store.io);
+                defer handle.impl.lock.unlock(store.io);
+                const keys = handle.resolved_imports.keys();
+                const snap = try arena.alloc(Uri, keys.len);
+                for (keys, 0..) |k, idx| snap[idx] = try k.dupe(arena);
+                break :snap snap;
+            };
+            try found_uris.ensureUnusedCapacity(arena, resolved_snapshot.len);
+            for (resolved_snapshot) |resolved_uri| {
+                if (DocumentStore.isInStd(resolved_uri)) continue;
+                found_uris.putAssumeCapacity(resolved_uri, {});
+            }
+
+            // Add import_table edges from the BuildConfig snapshot (zls-1ht).
+            // This covers module-name imports for files whose resolved_imports
+            // haven't been warmed by analysis yet. The snapshot was built
+            // during the seed phase while the config was locked.
+            if (import_table_snapshot.get(uri)) |import_uris| {
+                try found_uris.ensureUnusedCapacity(arena, import_uris.len);
+                for (import_uris) |import_uri| {
+                    found_uris.putAssumeCapacity(import_uri, {});
+                }
+            }
         }
+
+        // Union with loaded handles so files open in the editor but not
+        // in the module graph are still searched (zls-ez6). Without this,
+        // the build-system path is mutually exclusive with the fallback
+        // HandleIterator path, and loaded files that aren't module roots
+        // are silently dropped from the candidate set.
+        var it: DocumentStore.HandleIterator = .{ .store = store };
+        while (it.next()) |handle| {
+            if (DocumentStore.isInStd(handle.uri)) continue;
+            try found_uris.put(arena, handle.uri, {});
+        }
+
         return found_uris;
     }
 
@@ -371,6 +451,29 @@ fn gatherWorkspaceReferenceCandidates(
     var it: DocumentStore.HandleIterator = .{ .store = store };
     while (it.next()) |handle| {
         for (handle.file_imports) |import_uri| {
+            // On-demand loading (R6): load imports not yet in the store.
+            // Newly loaded handles are appended to the ArrayHashMap and
+            // visited later in this same iteration. Uses ensureHandleLoaded
+            // to avoid awaiting handles that are still being created
+            // (which would deadlock inside the iteration).
+            try store.ensureHandleLoaded(import_uri);
+
+            const gop = try per_file_dependants.getOrPutValue(arena, import_uri, .empty);
+            try gop.value_ptr.append(arena, handle.uri);
+        }
+
+        // Same union for resolved_imports (see build-system path comment).
+        const resolved_snapshot: []Uri = snap: {
+            handle.impl.lock.lockUncancelable(store.io);
+            defer handle.impl.lock.unlock(store.io);
+            const keys = handle.resolved_imports.keys();
+            const snap = try arena.alloc(Uri, keys.len);
+            for (keys, 0..) |k, idx| snap[idx] = try k.dupe(arena);
+            break :snap snap;
+        };
+        for (resolved_snapshot) |import_uri| {
+            if (DocumentStore.isInStd(import_uri)) continue;
+            try store.ensureHandleLoaded(import_uri);
             const gop = try per_file_dependants.getOrPutValue(arena, import_uri, .empty);
             try gop.value_ptr.append(arena, handle.uri);
         }
@@ -541,16 +644,37 @@ fn controlFlowReferences(
     return locations;
 }
 
+/// A single resolved call site, enriched with the enclosing caller function when one
+/// exists. `caller_fn_node` is `null` for calls that occur at file scope (inside a
+/// top-level `comptime` block with no enclosing fn). Consumers that only need the
+/// call location (e.g. `callsiteReferences` for type inference) ignore `caller_fn_node`.
+pub const CallSite = struct {
+    handle: *DocumentStore.Handle,
+    call_node: Ast.Node.Index,
+    caller_fn_node: ?Ast.Node.Index,
+};
+
 const CallBuilder = struct {
-    callsites: std.ArrayList(Analyser.NodeWithHandle) = .empty,
+    callsites: std.ArrayList(CallSite) = .empty,
     /// this is the declaration we are searching for
     target_decl: Analyser.DeclWithHandle,
     analyser: *Analyser,
 
     fn add(self: *CallBuilder, handle: *DocumentStore.Handle, call_node: Ast.Node.Index) error{OutOfMemory}!void {
+        const doc_scope = try handle.getDocumentScope();
+        const call_loc = offsets.nodeToLoc(&handle.tree, call_node);
+        const caller_fn_node: ?Ast.Node.Index = blk: {
+            const scope_index = Analyser.innermostScopeAtIndexWithTag(
+                doc_scope,
+                call_loc.start,
+                std.EnumSet(DocumentScope.Scope.Tag).initOne(.function),
+            ).unwrap() orelse break :blk null;
+            break :blk doc_scope.getScopeAstNode(scope_index).?;
+        };
         try self.callsites.append(self.analyser.arena, .{
             .handle = handle,
-            .node = call_node,
+            .call_node = call_node,
+            .caller_fn_node = caller_fn_node,
         });
     }
 
@@ -617,12 +741,16 @@ const CallBuilder = struct {
     }
 };
 
-pub fn callsiteReferences(
+/// Gather every call site of `decl_handle` across the workspace (or just the
+/// declaring file when `workspace == false`), enriched with the enclosing caller
+/// function node. This is the Approach C unified codepath used by both the
+/// call hierarchy feature and the backward-compatible `callsiteReferences` wrapper.
+pub fn callsiteReferencesWithCaller(
     analyser: *Analyser,
     decl_handle: Analyser.DeclWithHandle,
     /// search other files for references
     workspace: bool,
-) Analyser.Error!std.ArrayList(Analyser.NodeWithHandle) {
+) Analyser.Error!std.ArrayList(CallSite) {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
@@ -650,6 +778,25 @@ pub fn callsiteReferences(
     }
 
     return builder.callsites;
+}
+
+/// Backward-compatible wrapper: returns the old `NodeWithHandle` shape that existing
+/// consumers (e.g. `src/analysis.zig:1775` for callsite-based type inference) expect.
+/// MUST preserve every CallSite — including top-level calls where `caller_fn_node == null`
+/// — because the consumer does not care about caller context, only call node + handle.
+pub fn callsiteReferences(
+    analyser: *Analyser,
+    decl_handle: Analyser.DeclWithHandle,
+    /// search other files for references
+    workspace: bool,
+) Analyser.Error!std.ArrayList(Analyser.NodeWithHandle) {
+    const sites = try callsiteReferencesWithCaller(analyser, decl_handle, workspace);
+    var out: std.ArrayList(Analyser.NodeWithHandle) = .empty;
+    try out.ensureTotalCapacityPrecise(analyser.arena, sites.items.len);
+    for (sites.items) |cs| {
+        out.appendAssumeCapacity(.{ .handle = cs.handle, .node = cs.call_node });
+    }
+    return out;
 }
 
 pub const GeneralReferencesRequest = union(enum) {
@@ -680,6 +827,156 @@ pub const GeneralReferencesResponse = union {
     highlight: []types.DocumentHighlight,
 };
 
+/// findReferences on an `@import("...")` string literal.
+///
+/// Compares resolved URIs, not literal text — so `@import("mod_b")` and
+/// `@import("../b/root.zig")` that resolve to the same target cross-reference
+/// each other. Walks all `@import` string literals in each candidate file
+/// returned by `gatherWorkspaceReferenceCandidates`, resolves each via
+/// `uriFromImportStr`, and emits a `Location` when the candidate's resolved
+/// URI set intersects the target set.
+///
+/// Per zls-029 anti-patterns:
+///   - NO raw string matching (use `uriFromImportStr` for both sides)
+///   - NO `.zig`-extension filter on the walker (module-name imports don't
+///     have `.zig` — let `uriFromImportStr` decide what's resolvable)
+fn importStringReferences(
+    server: *Server,
+    arena: std.mem.Allocator,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    pos_context: Analyser.PositionContext,
+    encoding: offsets.Encoding,
+    include_decl: bool,
+) Server.Error!std.ArrayList(types.Location) {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    var locations: std.ArrayList(types.Location) = .empty;
+    errdefer locations.deinit(arena);
+
+    const store = &server.document_store;
+
+    // Extract cursor's import string (quotes excluded).
+    const target_loc = pos_context.stringLiteralContentLoc(handle.tree.source);
+    if (target_loc.start == target_loc.end) return locations;
+    const target_import_str = offsets.locToSlice(handle.tree.source, target_loc);
+
+    // Resolve cursor's target to a URI set. `.none` → empty result (R-I4).
+    const target_result = try store.uriFromImportStr(arena, handle, target_import_str);
+    var target_set: Uri.ArrayHashMap(void) = .empty;
+    switch (target_result) {
+        .none => return locations,
+        .one => |uri| try target_set.put(arena, uri, {}),
+        .many => |uris| {
+            try target_set.ensureUnusedCapacity(arena, uris.len);
+            for (uris) |uri| target_set.putAssumeCapacity(uri, {});
+        },
+    }
+
+    // Candidate discovery for @import references differs from symbol-reference
+    // search. The existing `gatherWorkspaceReferenceCandidates` does reverse
+    // BFS from the target handle — correct for "who calls fn foo" where
+    // callers transitively depend on foo's file, but wrong here:
+    //   1. Commonly-imported files like `std` are filtered out by the
+    //      `isInStd` guard (zls-mxw R-M7) — so std-as-target has no edges.
+    //   2. Two files sharing a target (R-I2) are NOT connected by dependency
+    //      at all — they're siblings in the import graph, not ancestors.
+    //
+    // Strategy: every file that's currently in the workspace could contain
+    // an `@import` to the target. Seed from HandleIterator (all loaded
+    // handles — Phase 1's eager transitive loading + zls-mxw's
+    // `resolved_imports` population keep this populated). For build-
+    // configured projects, additionally seed from all module roots to
+    // cover files that might not yet be loaded.
+    var candidate_set: Uri.ArrayHashMap(void) = .empty;
+    {
+        var it: DocumentStore.HandleIterator = .{ .store = store };
+        while (it.next()) |h| {
+            try candidate_set.put(arena, h.uri, {});
+        }
+    }
+    if (DocumentStore.supports_build_system) build_path: {
+        const resolved = switch (try handle.getAssociatedBuildFile(store)) {
+            .unresolved, .none => break :build_path,
+            .resolved => |r| r,
+        };
+        const build_config = resolved.build_file.tryLockConfig(store.io) orelse break :build_path;
+        defer resolved.build_file.unlockConfig(store.io);
+        const module_paths = build_config.modules.map.keys();
+        try candidate_set.ensureUnusedCapacity(arena, module_paths.len);
+        for (module_paths) |mp| {
+            const mp_uri: Uri = try .fromPath(arena, mp);
+            candidate_set.putAssumeCapacity(mp_uri, {});
+        }
+    }
+
+    for (candidate_set.keys()) |candidate_uri| {
+        const candidate_handle = (store.getOrLoadHandle(candidate_uri) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.OutOfMemory => return error.OutOfMemory,
+        }) orelse continue;
+
+        // Walk AST for @import builtin calls. Mirrors `DocumentStore.collectImports`
+        // structure (DocumentStore.zig:497) MINUS the `.zig` extension filter —
+        // module-name imports must participate.
+        const tree = &candidate_handle.tree;
+        const node_tags = tree.nodes.items(.tag);
+        for (node_tags, 0..) |tag, i| {
+            const node: Ast.Node.Index = @enumFromInt(@as(u32, @intCast(i)));
+            switch (tag) {
+                .builtin_call,
+                .builtin_call_comma,
+                .builtin_call_two,
+                .builtin_call_two_comma,
+                => {},
+                else => continue,
+            }
+            const builtin_name = offsets.tokenToSlice(tree, tree.nodeMainToken(node));
+            if (!std.mem.eql(u8, builtin_name, "@import")) continue;
+
+            var buffer: [2]Ast.Node.Index = undefined;
+            const params = tree.builtinCallParams(&buffer, node).?;
+            if (params.len < 1) continue;
+            if (tree.nodeTag(params[0]) != .string_literal) continue;
+
+            const str_token = tree.nodeMainToken(params[0]);
+            const str_loc = offsets.tokenToLoc(tree, str_token);
+            if (str_loc.end < str_loc.start + 2) continue; // need at least `""`
+            const content_loc: offsets.Loc = .{ .start = str_loc.start + 1, .end = str_loc.end - 1 };
+            const import_str = offsets.locToSlice(tree.source, content_loc);
+
+            // Resolve candidate's import string. `.none` → not a match.
+            const candidate_result = try store.uriFromImportStr(arena, candidate_handle, import_str);
+            const matches = switch (candidate_result) {
+                .none => false,
+                .one => |uri| target_set.contains(uri),
+                .many => |uris| blk: {
+                    for (uris) |uri| {
+                        if (target_set.contains(uri)) break :blk true;
+                    }
+                    break :blk false;
+                },
+            };
+            if (!matches) continue;
+
+            // Self-reference (cursor's own site) is included only if
+            // `include_decl` is true (LSP `includeDeclaration` semantics).
+            const is_self = candidate_handle == handle and
+                content_loc.start <= source_index and
+                source_index <= content_loc.end;
+            if (is_self and !include_decl) continue;
+
+            try locations.append(arena, .{
+                .uri = candidate_handle.uri.raw,
+                .range = offsets.locToRange(candidate_handle.tree.source, content_loc, encoding),
+            });
+        }
+    }
+
+    return locations;
+}
+
 pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: GeneralReferencesRequest) Server.Error!?GeneralReferencesResponse {
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
@@ -704,6 +1001,18 @@ pub fn referencesHandler(server: *Server, arena: std.mem.Allocator, request: Gen
 
     // TODO: Make this work with branching types
     const locations = locs: {
+        if (pos_context == .import_string_literal and request != .rename) {
+            break :locs try importStringReferences(
+                server,
+                arena,
+                handle,
+                source_index,
+                pos_context,
+                server.offset_encoding,
+                include_decl,
+            );
+        }
+
         if (pos_context == .keyword and request != .rename) {
             break :locs try controlFlowReferences(
                 arena,

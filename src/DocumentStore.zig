@@ -165,6 +165,12 @@ pub const Handle = struct {
     tree: Ast,
     /// List of every file that has been `@Import`ed. Does not include imported modules.
     file_imports: []const Uri,
+    /// Set of URIs that have been resolved through `uriFromImportStr` — covers
+    /// module-name imports (`@import("mod_b")`), `std`, `builtin`, `root`, and
+    /// build dependencies. Populated lazily as analysis exercises resolution.
+    /// Guarded by `impl.lock`. Cleared in `Handle.refresh` on re-parse.
+    /// URIs are duped with `store.allocator` and freed in `Handle.deinit`.
+    resolved_imports: Uri.ArrayHashMap(void) = .empty,
     /// Contains one entry for every `@cImport` in the document
     cimports: std.MultiArrayList(CImportHandle),
     /// `true` if the document has been directly opened by the client i.e. with `textDocument/didOpen`
@@ -458,6 +464,15 @@ pub const Handle = struct {
         handle.document_scope = .unset;
         old_handle.trigram_store = handle.trigram_store;
         handle.trigram_store = .unset;
+
+        // `resolved_imports` is mutated concurrently by `uriFromImportStr`
+        // running on OTHER handles' analyser contexts that happen to pass
+        // `handle` as the resolving handle. Swap under `impl.lock` so a
+        // concurrent insert can't observe the map mid-move.
+        handle.impl.lock.lockUncancelable(handle.impl.store.io);
+        old_handle.resolved_imports = handle.resolved_imports;
+        handle.resolved_imports = .empty;
+        handle.impl.lock.unlock(handle.impl.store.io);
     }
 
     fn parseTree(allocator: std.mem.Allocator, new_text: [:0]const u8, mode: Ast.Mode) error{OutOfMemory}!Ast {
@@ -557,6 +572,23 @@ pub const Handle = struct {
         },
     };
 
+    /// Cache a resolved import URI on this handle's `resolved_imports` set.
+    /// Called by `uriFromImportStr` for every successful `.one`/`.many` resolution.
+    /// Dupes the URI with `store.allocator` (the set owns the dupe) and dedups
+    /// via `getOrPut` — if the URI is already present, the dupe is freed.
+    ///
+    /// Takes `impl.lock` briefly. Caller MUST NOT hold `impl.lock`.
+    fn cacheResolvedImport(handle: *Handle, store: *DocumentStore, uri: Uri) error{OutOfMemory}!void {
+        var duped = try uri.dupe(store.allocator);
+        errdefer duped.deinit(store.allocator);
+
+        handle.impl.lock.lockUncancelable(store.io);
+        defer handle.impl.lock.unlock(store.io);
+
+        const gop = try handle.resolved_imports.getOrPut(store.allocator, duped);
+        if (gop.found_existing) duped.deinit(store.allocator);
+    }
+
     /// Caller must free `Handle.uri` if needed.
     /// Keep in sync with `dead`.
     fn deinit(self: *Handle, allocator: std.mem.Allocator) void {
@@ -571,6 +603,9 @@ pub const Handle = struct {
         self.trigram_store.deinit(allocator);
         for (self.file_imports) |uri| uri.deinit(allocator);
         allocator.free(self.file_imports);
+
+        for (self.resolved_imports.keys()) |uri| uri.deinit(allocator);
+        self.resolved_imports.deinit(allocator);
 
         for (self.cimports.items(.source)) |source| allocator.free(source);
         self.cimports.deinit(allocator);
@@ -793,6 +828,37 @@ pub fn getOrLoadHandle(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMem
         error.Canceled, error.OutOfMemory => |e| return e,
         else => return null,
     };
+}
+
+/// Ensures the document at `uri` is present in the store without awaiting an
+/// in-progress load. Unlike `getOrLoadHandle`, this is safe to call from
+/// within recursive document loading (e.g. eager transitive imports) because
+/// it never blocks on a handle whose creation hasn't completed yet.
+///
+/// If the URI is already in the handles map — regardless of whether its
+/// loading has finished — this returns immediately. Otherwise it triggers a
+/// fresh load via `getOrLoadHandle`.
+///
+/// Non-file-scheme URIs (e.g. `untitled://`) cannot be loaded from disk and
+/// are treated as no-ops.
+///
+/// Only propagates `Canceled` / `OutOfMemory`; other load errors are silently
+/// swallowed (matching `getOrLoadHandle`'s null-return semantics).
+///
+/// **Thread safe** takes an exclusive lock briefly for the contains check.
+pub fn ensureHandleLoaded(self: *DocumentStore, uri: Uri) error{ Canceled, OutOfMemory }!void {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    if (!uri.isFileScheme()) return;
+
+    {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.handles.contains(uri)) return;
+    }
+
+    _ = try self.getOrLoadHandle(uri);
 }
 
 /// **Thread safe** takes a shared lock
@@ -1667,8 +1733,25 @@ fn createAndStoreDocument(
         store.allocator,
     );
     old_handle.deinit(store.allocator);
-
     handle_future.err = null;
+
+    // Signal that this handle is fully loaded BEFORE triggering eager
+    // transitive loading. This way, if the recursive load chain somehow
+    // routes back to this URI (defensive — Zig disallows circular
+    // @imports), any waiters see a ready handle rather than deadlocking
+    // on an unset event. The existing `defer` at the top of this block
+    // will no-op on function return (Event.set is idempotent).
+    handle_future.event.set(store.io);
+
+    // Eagerly load transitive imports (R5).
+    // Uses ensureHandleLoaded (not getOrLoadHandle) so this function is
+    // safe to call recursively — ensureHandleLoaded never awaits an
+    // in-progress load, it only triggers fresh loads for URIs absent
+    // from the store.
+    for (handle_future.handle.file_imports) |import_uri| {
+        try store.ensureHandleLoaded(import_uri);
+    }
+
     return &handle_future.handle;
 }
 
@@ -1971,10 +2054,17 @@ pub const UriFromImportStringResult = union(enum) {
     }
 };
 
-/// takes the string inside a @import() node (without the quotation marks)
-/// and returns it's uri
-/// caller owns the returned memory
-/// **Thread safe** takes a shared lock
+/// Takes the string inside a `@import()` node (without the quotation marks)
+/// and returns its URI. Caller owns the returned memory.
+///
+/// On any successful resolution (`.one` / `.many`), this function also caches
+/// the resolved URI(s) into `handle.resolved_imports` so module-name import
+/// edges become visible to the reverse reference search
+/// (`gatherWorkspaceReferenceCandidates`). The cache persists until the handle
+/// is re-parsed (`Handle.refresh`) or freed.
+///
+/// **Thread safe.** Internally takes `handle.impl.lock` briefly during caching.
+/// **Caller MUST NOT hold `handle.impl.lock`** — `std.Io.Mutex` is not re-entrant.
 pub fn uriFromImportStr(
     self: *DocumentStore,
     allocator: std.mem.Allocator,
@@ -1984,6 +2074,24 @@ pub fn uriFromImportStr(
     const tracy_zone = tracy.trace(@src());
     defer tracy_zone.end();
 
+    var result = try self.uriFromImportStrImpl(allocator, handle, import_str);
+    errdefer result.deinit(allocator);
+
+    switch (result) {
+        .none => {},
+        .one => |uri| try handle.cacheResolvedImport(self, uri),
+        .many => |uris| for (uris) |uri| try handle.cacheResolvedImport(self, uri),
+    }
+
+    return result;
+}
+
+fn uriFromImportStrImpl(
+    self: *DocumentStore,
+    allocator: std.mem.Allocator,
+    handle: *Handle,
+    import_str: []const u8,
+) error{ Canceled, OutOfMemory }!UriFromImportStringResult {
     if (std.mem.endsWith(u8, import_str, ".zig") or std.mem.endsWith(u8, import_str, ".zon")) {
         const parsed_uri = handle.uri.toStdUri();
         return .{ .one = try Uri.resolveImport(allocator, handle.uri, parsed_uri, import_str) };

@@ -552,6 +552,7 @@ fn initializeHandler(server: *Server, arena: std.mem.Allocator, request: types.I
             .declarationProvider = .{ .bool = true },
             .definitionProvider = .{ .bool = true },
             .typeDefinitionProvider = .{ .bool = true },
+            .callHierarchyProvider = .{ .call_hierarchy_options = .{} },
             .implementationProvider = .{ .bool = false },
             .referencesProvider = .{ .bool = true },
             .documentSymbolProvider = .{ .bool = true },
@@ -1471,6 +1472,16 @@ fn prepareRenameHandler(server: *Server, arena: std.mem.Allocator, request: type
     };
     const handle = server.document_store.getHandle(document_uri) orelse return null;
     const source_index = offsets.positionToIndex(handle.tree.source, request.position, server.offset_encoding);
+
+    // zls-029 R-I5: `@import` string literals are not symbol declarations and
+    // must not offer a rename placeholder. `identifierLocFromIndex` already
+    // returns null for string-literal tokens, but make the contract explicit
+    // so the rejection is visible at this layer — not a by-product of a
+    // downstream helper. Renaming import paths / module names would require
+    // reverse-edge traversal in build.zig, which is out of scope.
+    const pos_context = try Analyser.getPositionContext(arena, &handle.tree, source_index, true);
+    if (pos_context == .import_string_literal) return null;
+
     const name_loc = offsets.identifierLocFromIndex(&handle.tree, source_index) orelse return null;
     const name = offsets.locToSlice(handle.tree.source, name_loc);
     return .{
@@ -1585,6 +1596,18 @@ fn workspaceSymbolHandler(server: *Server, arena: std.mem.Allocator, request: ty
     return try @import("features/workspace_symbols.zig").handler(server, arena, request);
 }
 
+fn prepareCallHierarchyHandler(server: *Server, arena: std.mem.Allocator, request: types.call_hierarchy.PrepareParams) Error!?[]const types.call_hierarchy.Item {
+    return try @import("features/call_hierarchy.zig").prepareHandler(server, arena, request);
+}
+
+fn incomingCallsHandler(server: *Server, arena: std.mem.Allocator, request: types.call_hierarchy.IncomingCallsParams) Error!?[]const types.call_hierarchy.IncomingCall {
+    return try @import("features/call_hierarchy.zig").incomingCallsHandler(server, arena, request);
+}
+
+fn outgoingCallsHandler(server: *Server, arena: std.mem.Allocator, request: types.call_hierarchy.OutgoingCallsParams) Error!?[]const types.call_hierarchy.OutgoingCall {
+    return try @import("features/call_hierarchy.zig").outgoingCallsHandler(server, arena, request);
+}
+
 const HandledRequestParams = union(enum) {
     initialize: types.InitializeParams,
     shutdown,
@@ -1608,6 +1631,9 @@ const HandledRequestParams = union(enum) {
     @"textDocument/codeAction": types.CodeAction.Params,
     @"textDocument/foldingRange": types.FoldingRange.Params,
     @"textDocument/selectionRange": types.SelectionRange.Params,
+    @"textDocument/prepareCallHierarchy": types.call_hierarchy.PrepareParams,
+    @"callHierarchy/incomingCalls": types.call_hierarchy.IncomingCallsParams,
+    @"callHierarchy/outgoingCalls": types.call_hierarchy.OutgoingCallsParams,
     @"workspace/symbol": types.workspace.Symbol.Params,
     other: lsp.MethodWithParams,
 };
@@ -1653,6 +1679,9 @@ fn isBlockingMessage(msg: Message) bool {
             .@"textDocument/codeAction",
             .@"textDocument/foldingRange",
             .@"textDocument/selectionRange",
+            .@"textDocument/prepareCallHierarchy",
+            .@"callHierarchy/incomingCalls",
+            .@"callHierarchy/outgoingCalls",
             .@"workspace/symbol",
             => return false,
             .other => return false,
@@ -1823,6 +1852,9 @@ pub fn sendRequestSync(server: *Server, arena: std.mem.Allocator, comptime metho
         .@"textDocument/codeAction" => try server.codeActionHandler(arena, params),
         .@"textDocument/foldingRange" => try server.foldingRangeHandler(arena, params),
         .@"textDocument/selectionRange" => try server.selectionRangeHandler(arena, params),
+        .@"textDocument/prepareCallHierarchy" => try server.prepareCallHierarchyHandler(arena, params),
+        .@"callHierarchy/incomingCalls" => try server.incomingCallsHandler(arena, params),
+        .@"callHierarchy/outgoingCalls" => try server.outgoingCallsHandler(arena, params),
         .@"workspace/symbol" => try server.workspaceSymbolHandler(arena, params),
         .other => return null,
     };
